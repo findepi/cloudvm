@@ -5,9 +5,10 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from cloudvm import _cli as cb  # noqa: E402
+from cloudvm import _build_info, _cli as cb  # noqa: E402
 
 
 SAMPLE_CONFIG = """\
@@ -252,6 +253,18 @@ class HostLineParseTests(unittest.TestCase):
         self.assertIsNone(cb._host_tokens("HostName 1.2.3.4\n"))
         self.assertIsNone(cb._host_tokens("    Hostname 1.2.3.4\n"))
         self.assertIsNone(cb._host_tokens("# Host comment\n"))
+
+
+class VersionStringTests(unittest.TestCase):
+    def test_without_build_info(self):
+        with patch.object(_build_info, "COMMIT", ""), patch.object(_build_info, "DATE", ""):
+            with patch.object(cb, "_installed_version", return_value="1.2.3"):
+                self.assertEqual(cb._version_string(), "cloudvm 1.2.3 ( )")
+
+    def test_with_commit_and_date(self):
+        with patch.object(_build_info, "COMMIT", "abc123def"), patch.object(_build_info, "DATE", "2026-06-03"):
+            with patch.object(cb, "_installed_version", return_value="1.2.3"):
+                self.assertEqual(cb._version_string(), "cloudvm 1.2.3 (abc123def 2026-06-03)")
 
 
 if __name__ == "__main__":

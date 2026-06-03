@@ -57,8 +57,16 @@ jobs:
           COUNT=$(git rev-list --count HEAD)
           STAMP=$(date -u +%Y%m%d%H%M%S)
           VERSION="${VERSION_PREFIX}.${COUNT}.${STAMP}"
-          echo "Building cloudvm $VERSION"
+          COMMIT=$(git rev-parse HEAD)
+          BUILT=$(date -u +%Y-%m-%d)
+          echo "Building cloudvm $VERSION ($COMMIT $BUILT)"
           uv version "$VERSION"
+          # Export build provenance into the package.
+          # The commit hash cannot be attached to version string in legible way.
+          cat > cloudvm/_build_info.py <<EOF
+          COMMIT = "${COMMIT}"
+          DATE = "${BUILT}"
+          EOF
 
       - name: Sync hash-pinned build backend from uv.lock
         run: uv sync --only-group build --locked --python "$BUILD_PYTHON"

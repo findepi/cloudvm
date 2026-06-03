@@ -16,6 +16,8 @@ from collections.abc import Callable
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
+from cloudvm import _build_info
+
 
 SSH_CONFIG = Path.home() / ".ssh" / "config"
 SSH_CONFIG_BACKUP = Path.home() / ".ssh" / "config.bak"
@@ -472,12 +474,19 @@ def _installed_version() -> str:
         return "(unknown)"
 
 
+def _version_string() -> str:
+    version_string = _installed_version()
+    commit = _build_info.COMMIT
+    date = _build_info.DATE
+    return f"cloudvm {version_string} ({commit} {date})"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cloudvm",
         description="Manage cloud development instances. Currently AWS EC2 is supported.",
     )
-    parser.add_argument("--version", action="version", version=f"cloudvm {_installed_version()}")
+    parser.add_argument("--version", action="version", version=_version_string())
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     up = sub.add_parser("up", help="ensure SSO + start instance + print public IP")

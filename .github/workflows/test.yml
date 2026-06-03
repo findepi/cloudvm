@@ -35,13 +35,18 @@ jobs:
       - name: Verify production build path with explicit release version
         # MUST stay in sync with publish.yml's three build steps (Compute
         # release version, Sync build backend, Build sdist and wheel).
-        # Exercises the file-mutation `uv version` step, the hash-pinned
-        # --no-build-isolation build, and that the entry point in the
-        # resulting wheel reports the version that was set.
+        # Exercises the file-mutation `uv version` step, the build-info
+        # write, the hash-pinned --no-build-isolation build, and that
+        # the entry point in the resulting wheel reports the version and
+        # build metadata that were set.
         if: matrix.python-version == '3.12'
         run: |
           uv version 1.2.3.4.5
+          cat > cloudvm/_build_info.py <<EOF
+          COMMIT = "deadbeef0"
+          DATE = "2026-01-01"
+          EOF
           uv sync --only-group build --locked
           uv build --no-build-isolation
           uv run --isolated --no-project --with dist/*.whl cloudvm --version \
-            | grep -F "cloudvm 1.2.3.4.5"
+            | grep -F "cloudvm 1.2.3.4.5 (deadbeef0 2026-01-01)"
