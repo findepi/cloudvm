@@ -1,0 +1,94 @@
+name: publish
+
+# Publishes a new version to PyPI on every push to main.
+#
+# Version format: {PREFIX}.{commit-count}.{utc-timestamp}
+#   Example with PREFIX=0.1: 0.1.42.20260603101300
+#   Bump PREFIX to "1" when cutting the 1.0 line; both 4-segment and 3-segment
+#   release strings are valid PEP 440.
+#
+# Versioning is forward-only and tied to commit history; manual triggers are
+# intentionally not supported because a workflow_dispatch run could produce a
+# version string that doesn't match its own commit ordering.
+#
+# The build and publish steps run in separate jobs as a defense-in-depth measure:
+# the build job has no id-token permission, so a compromised build dependency
+# cannot exfiltrate the OIDC token used for Trusted Publishing.
+#
+# First-time PyPI setup (one-off) at https://pypi.org/manage/account/publishing/:
+#   - PyPI Project Name: cloudvm
+#   - Owner:             findepi
+#   - Repository name:   cloudvm
+#   - Workflow name:     publish.yml
+#   - Environment name:  pypi
+on:
+  push:
+    branches: [main]
+
+env:
+  VERSION_PREFIX: "0.1"
+  # Python version used to assemble the build environment.
+  BUILD_PYTHON: "3.12"
+
+jobs:
+  build:
+    name: Build sdist and wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0  # full history; git rev-list --count needs it
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b  # v8.1.0
+        with:
+          enable-cache: true
+
+      - name: Install Python ${{ env.BUILD_PYTHON }}
+        run: uv python install "$BUILD_PYTHON"
+
+      # The next three steps (Compute release version, Sync build backend,
+      # Build sdist and wheel) MUST stay in sync with test.yml's "Verify
+      # production build path with explicit release version" step, which
+      # replays the same commands against a synthetic version so a divergence
+      # is caught in test rather than at publish time.
+      - name: Compute release version
+        run: |
+          COUNT=$(git rev-list --count HEAD)
+          STAMP=$(date -u +%Y%m%d%H%M%S)
+          VERSION="${VERSION_PREFIX}.${COUNT}.${STAMP}"
+          echo "Building cloudvm $VERSION"
+          uv version "$VERSION"
+
+      - name: Sync hash-pinned build backend from uv.lock
+        run: uv sync --only-group build --locked --python "$BUILD_PYTHON"
+
+      - name: Build sdist and wheel
+        # --no-build-isolation uses the .venv populated above (hash-verified
+        # via uv.lock) instead of letting the build frontend fetch the
+        # backend afresh.
+        run: uv build --no-build-isolation
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/cloudvm
+    permissions:
+      id-token: write  # required for PyPI trusted publishing (OIDC)
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0

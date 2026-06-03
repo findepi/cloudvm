@@ -1,0 +1,58 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cloudvm"
+# Version is static here; CI rewrites it via `uv version <X>` before `uv build`.
+# Runtime `cloudvm --version` reads installed package metadata via
+# importlib.metadata.version("cloudvm") — there is no env-var override.
+version = "0.0.0"
+description = "Manage cloud development instances. Currently AWS EC2 is supported."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "Apache-2.0"
+authors = [
+    { name = "Piotr Findeisen" },
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Systems Administration",
+    "Topic :: Utilities",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/findepi/cloudvm"
+Issues = "https://github.com/findepi/cloudvm/issues"
+
+[project.scripts]
+cloudvm = "cloudvm:main"
+
+[dependency-groups]
+# Build backend, hash-pinned via uv.lock. Used by CI as
+# `uv sync --only-group build` before `uv build --no-build-isolation`.
+# Kept in sync with [build-system] requires above — both must list the
+# same backend so non-uv frontends (e.g. `python -m build` from a source
+# checkout) still work.
+build = ["hatchling"]
+
+[tool.uv]
+# Single source of truth for the uv version used in CI. setup-uv reads
+# `required-version` from this file automatically.
+required-version = "==0.11.18"
+
+[tool.hatch.build.targets.wheel]
+only-include = ["cloudvm.py"]
+
+[tool.hatch.build.targets.sdist]
+include = ["cloudvm.py", "tests/", "README.md", "LICENSE", "pyproject.toml"]
