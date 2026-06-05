@@ -32,6 +32,9 @@ jobs:
       - name: Lint
         run: uv run ruff check
 
+      - name: Format check
+        run: uv run ruff format --check
+
       - name: Run tests
         run: uv run python -m unittest discover tests -v
 

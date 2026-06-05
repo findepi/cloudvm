@@ -103,9 +103,7 @@ class SshConfigEditTests(unittest.TestCase):
         before = self.path.read_text()
         cb.update_ssh_config("my-dev-box-3", "9.9.9.9")
         after = self.path.read_text()
-        diff_lines = [
-            (b, a) for b, a in zip(before.splitlines(), after.splitlines()) if b != a
-        ]
+        diff_lines = [(b, a) for b, a in zip(before.splitlines(), after.splitlines()) if b != a]
         # Exactly one line should differ
         self.assertEqual(len(diff_lines), 1)
         b, a = diff_lines[0]
@@ -270,9 +268,11 @@ class VersionStringTests(unittest.TestCase):
 
 def _fake_aws_configure_list(stdout: str):
     """Return a side_effect for run_aws that returns `stdout` for `configure list`."""
+
     def _run(args, **kwargs):
         assert args[:2] == ["configure", "list"], args
         return subprocess.CompletedProcess(args=args, returncode=0, stdout=stdout, stderr="")
+
     return _run
 
 
@@ -335,9 +335,7 @@ class ConfiguredRegionTests(unittest.TestCase):
                 cb._configured_region()
 
     def test_fails_when_region_row_missing(self):
-        stdout = "\n".join(
-            line for line in CONFIGURE_LIST_CONFIG_FILE.splitlines() if not line.startswith("region")
-        )
+        stdout = "\n".join(line for line in CONFIGURE_LIST_CONFIG_FILE.splitlines() if not line.startswith("region"))
         with patch.object(cb, "run_aws", side_effect=_fake_aws_configure_list(stdout)):
             with self.assertRaises(cb.CloudvmError):
                 cb._configured_region()

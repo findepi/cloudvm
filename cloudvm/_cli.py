@@ -68,14 +68,18 @@ def ensure_sso() -> None:
 
 def describe_instance(name: str, region: str | None = None) -> dict:
     """Return the single instance matching tag:Name=<name> (excluding terminated/shutting-down)."""
-    result = run_aws([
-        "ec2", "describe-instances",
-        *_region_args(region),
-        "--filters",
-        f"Name=tag:Name,Values={name}",
-        "Name=instance-state-name,Values=pending,running,stopping,stopped",
-        "--output", "json",
-    ])
+    result = run_aws(
+        [
+            "ec2",
+            "describe-instances",
+            *_region_args(region),
+            "--filters",
+            f"Name=tag:Name,Values={name}",
+            "Name=instance-state-name,Values=pending,running,stopping,stopped",
+            "--output",
+            "json",
+        ]
+    )
     data = json.loads(result.stdout)
     instances = [i for r in data.get("Reservations", []) for i in r.get("Instances", [])]
     if not instances:
@@ -118,13 +122,19 @@ def ensure_running(instance: dict, region: str | None = None) -> None:
 def wait_for_public_ip(instance_id: str, region: str | None = None) -> str:
     deadline = time.monotonic() + IP_POLL_SECONDS
     while True:
-        result = run_aws([
-            "ec2", "describe-instances",
-            *_region_args(region),
-            "--instance-ids", instance_id,
-            "--query", "Reservations[0].Instances[0].PublicIpAddress",
-            "--output", "text",
-        ])
+        result = run_aws(
+            [
+                "ec2",
+                "describe-instances",
+                *_region_args(region),
+                "--instance-ids",
+                instance_id,
+                "--query",
+                "Reservations[0].Instances[0].PublicIpAddress",
+                "--output",
+                "text",
+            ]
+        )
         ip = result.stdout.strip()
         if ip and ip != "None":
             return ip
@@ -303,9 +313,7 @@ def update_ssh_config(alias: str, ip: str) -> None:
                 resolved = line.split(" ", 1)[1].strip()
                 break
         if resolved != ip:
-            raise CloudvmError(
-                f"validation: ssh -G resolved hostname to {resolved!r}, expected {ip!r}"
-            )
+            raise CloudvmError(f"validation: ssh -G resolved hostname to {resolved!r}, expected {ip!r}")
         shutil.copyfile(SSH_CONFIG, SSH_CONFIG_BACKUP)
         os.replace(tmp, SSH_CONFIG)
     finally:
@@ -320,9 +328,12 @@ def validate_ssh(alias: str) -> None:
     result = subprocess.run(
         [
             "ssh",
-            "-o", "BatchMode=yes",
-            "-o", "StrictHostKeyChecking=no",
-            "-o", "ConnectTimeout=5",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "ConnectTimeout=5",
             alias,
             "echo OK",
         ],
@@ -337,6 +348,7 @@ def validate_ssh(alias: str) -> None:
 
 
 # --- subcommand handlers ---
+
 
 def cmd_up(args: argparse.Namespace) -> int:
     ensure_sso()
@@ -394,12 +406,18 @@ def list_aws_regions() -> list[str]:
     # `describe-regions` is itself a regional API and needs --region. Prefer the user's
     # configured region (likely nearest/cheapest); fall back to us-east-1 when none is set.
     region = _configured_region() or "us-east-1"
-    result = run_aws([
-        "ec2", "describe-regions",
-        "--region", region,
-        "--query", "Regions[].RegionName",
-        "--output", "json",
-    ])
+    result = run_aws(
+        [
+            "ec2",
+            "describe-regions",
+            "--region",
+            region,
+            "--query",
+            "Regions[].RegionName",
+            "--output",
+            "json",
+        ]
+    )
     return sorted(json.loads(result.stdout))
 
 
@@ -422,16 +440,12 @@ def _configured_region() -> str | None:
         if name.strip() != "region":
             continue
         if not sep:
-            raise CloudvmError(
-                f"unexpected `aws configure list` row (no ':' separator): {line!r}"
-            )
+            raise CloudvmError(f"unexpected `aws configure list` row (no ':' separator): {line!r}")
         value = rest.partition(":")[0].strip()
         if value == "<not set>":
             return None
         if not _REGION_NAME_RE.match(value):
-            raise CloudvmError(
-                f"unexpected region value from `aws configure list`: {value!r}"
-            )
+            raise CloudvmError(f"unexpected region value from `aws configure list`: {value!r}")
         return value
     raise CloudvmError("could not find 'region' row in `aws configure list` output")
 
@@ -440,14 +454,13 @@ def _effective_region() -> str:
     """Return the AWS region in use."""
     region = _configured_region()
     if region is None:
-        raise CloudvmError(
-            "no AWS region configured (set AWS_REGION, AWS_DEFAULT_REGION, or `aws configure`)"
-        )
+        raise CloudvmError("no AWS region configured (set AWS_REGION, AWS_DEFAULT_REGION, or `aws configure`)")
     return region
 
 
-def format_table(headers: list[str], rows: list[list[str]],
-                 col_wrappers: list[Callable[[str], str] | None] | None = None) -> str:
+def format_table(
+    headers: list[str], rows: list[list[str]], col_wrappers: list[Callable[[str], str] | None] | None = None
+) -> str:
     """Format a left-aligned text table. Width is computed from raw cell strings;
     if `col_wrappers[i]` is given, it wraps the already-padded data cell in column i
     (e.g., to add ANSI color codes). Wrappers are not applied to headers."""
@@ -464,22 +477,29 @@ def format_table(headers: list[str], rows: list[list[str]],
             cells.append(w(padded) if w else padded)
         return sep.join(cells)
 
-    return "\n".join([
-        sep.join(h.ljust(w) for h, w in zip(headers, widths)),
-        sep.join("-" * w for w in widths),
-        *(fmt_data_row(r) for r in rows),
-    ])
+    return "\n".join(
+        [
+            sep.join(h.ljust(w) for h, w in zip(headers, widths)),
+            sep.join("-" * w for w in widths),
+            *(fmt_data_row(r) for r in rows),
+        ]
+    )
 
 
 def _list_in_region(name_pattern: str, region: str) -> list[list[str]]:
-    result = run_aws([
-        "ec2", "describe-instances",
-        "--region", region,
-        "--filters",
-        f"Name=tag:Name,Values={name_pattern}",
-        "Name=instance-state-name,Values=pending,running,stopping,stopped",
-        "--output", "json",
-    ])
+    result = run_aws(
+        [
+            "ec2",
+            "describe-instances",
+            "--region",
+            region,
+            "--filters",
+            f"Name=tag:Name,Values={name_pattern}",
+            "Name=instance-state-name,Values=pending,running,stopping,stopped",
+            "--output",
+            "json",
+        ]
+    )
     data = json.loads(result.stdout)
     rows: list[list[str]] = []
     for r in data.get("Reservations", []):
@@ -501,9 +521,7 @@ def cmd_list(args: argparse.Namespace) -> int:
         all_regions = list_aws_regions()
         regions = match_globs(all_regions, region_patterns)
         if not regions:
-            raise CloudvmError(
-                f"no AWS regions match {region_patterns!r} (available: {len(all_regions)} regions)"
-            )
+            raise CloudvmError(f"no AWS regions match {region_patterns!r} (available: {len(all_regions)} regions)")
         for region in regions:
             rows.extend(_list_in_region(name_pattern, region))
     else:
@@ -514,8 +532,7 @@ def cmd_list(args: argparse.Namespace) -> int:
         return 0
 
     rows.sort(key=lambda r: (r[0], r[1], r[2]))
-    print(format_table(["region", "name", "status", "public IP"], rows,
-                       col_wrappers=[None, None, _hl, None]))
+    print(format_table(["region", "name", "status", "public IP"], rows, col_wrappers=[None, None, _hl, None]))
     return 0
 
 
@@ -543,26 +560,28 @@ def build_parser() -> argparse.ArgumentParser:
 
     up = sub.add_parser("up", help="ensure SSO + start instance + print public IP")
     up.add_argument("--name", "-n", required=True, help="EC2 Name tag of the instance")
-    up.add_argument("--region", "-r", default=None,
-                    help="AWS region; omit to let aws-cli use its own default")
-    up.add_argument("--update-ssh", action="store_true",
-                    help="update the matching Host block's Hostname in ~/.ssh/config")
-    up.add_argument("--ssh-alias",
-                    help="ssh_config Host alias to update (defaults to --name)")
+    up.add_argument("--region", "-r", default=None, help="AWS region; omit to let aws-cli use its own default")
+    up.add_argument(
+        "--update-ssh", action="store_true", help="update the matching Host block's Hostname in ~/.ssh/config"
+    )
+    up.add_argument("--ssh-alias", help="ssh_config Host alias to update (defaults to --name)")
     up.set_defaults(func=cmd_up)
 
     down = sub.add_parser("down", help="trigger stop on a running instance (does not wait for fully stopped)")
     down.add_argument("--name", "-n", required=True, help="EC2 Name tag of the instance")
-    down.add_argument("--region", "-r", default=None,
-                     help="AWS region; omit to let aws-cli use its own default")
+    down.add_argument("--region", "-r", default=None, help="AWS region; omit to let aws-cli use its own default")
     down.set_defaults(func=cmd_down)
 
     lst = sub.add_parser("list", help="list instances across regions matching name and region globs")
-    lst.add_argument("--region", "-r", action="append", default=None,
-                     help="region glob(s); repeatable and/or comma-separated (e.g. 'eu-central-*,us-*'). "
-                          "Defaults to AWS_REGION / AWS_DEFAULT_REGION.")
-    lst.add_argument("--name", "-n", default="*",
-                     help="Name-tag glob; AWS-native wildcards '*' and '?' (default: '*')")
+    lst.add_argument(
+        "--region",
+        "-r",
+        action="append",
+        default=None,
+        help="region glob(s); repeatable and/or comma-separated (e.g. 'eu-central-*,us-*'). "
+        "Defaults to AWS_REGION / AWS_DEFAULT_REGION.",
+    )
+    lst.add_argument("--name", "-n", default="*", help="Name-tag glob; AWS-native wildcards '*' and '?' (default: '*')")
     lst.set_defaults(func=cmd_list)
 
     return parser
