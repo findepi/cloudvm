@@ -558,6 +558,14 @@ class _PrintCompletionAction(argparse.Action):
         parser.exit()
 
 
+def _complete_region(prefix, **kwargs):
+    # Runs inside the shell completion hook; never raise — surface failures as empty suggestions.
+    try:
+        return list_aws_regions()
+    except Exception:
+        return []
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cloudvm",
@@ -577,7 +585,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     up = sub.add_parser("up", help="ensure SSO + start instance + print public IP")
     up.add_argument("--name", "-n", required=True, help="EC2 Name tag of the instance")
-    up.add_argument("--region", "-r", default=None, help="AWS region; omit to let aws-cli use its own default")
+    up.add_argument(
+        "--region", "-r", default=None, help="AWS region; omit to let aws-cli use its own default"
+    ).completer = _complete_region
     up.add_argument(
         "--update-ssh", action="store_true", help="update the matching Host block's Hostname in ~/.ssh/config"
     )
@@ -586,7 +596,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     down = sub.add_parser("down", help="trigger stop on a running instance (does not wait for fully stopped)")
     down.add_argument("--name", "-n", required=True, help="EC2 Name tag of the instance")
-    down.add_argument("--region", "-r", default=None, help="AWS region; omit to let aws-cli use its own default")
+    down.add_argument(
+        "--region", "-r", default=None, help="AWS region; omit to let aws-cli use its own default"
+    ).completer = _complete_region
     down.set_defaults(func=cmd_down)
 
     lst = sub.add_parser("list", help="list instances across regions matching name and region globs")
@@ -597,7 +609,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="region glob(s); repeatable and/or comma-separated (e.g. 'eu-central-*,us-*'). "
         "Defaults to AWS_REGION / AWS_DEFAULT_REGION.",
-    )
+    ).completer = _complete_region
     lst.add_argument("--name", "-n", default="*", help="Name-tag glob; AWS-native wildcards '*' and '?' (default: '*')")
     lst.set_defaults(func=cmd_list)
 
