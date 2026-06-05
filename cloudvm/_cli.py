@@ -391,18 +391,55 @@ def match_globs(values: list[str], patterns: list[str]) -> list[str]:
 
 
 def list_aws_regions() -> list[str]:
-    result = run_aws(["ec2", "describe-regions", "--query", "Regions[].RegionName", "--output", "json"])
+    # `describe-regions` is itself a regional API and needs --region. Prefer the user's
+    # configured region (likely nearest/cheapest); fall back to us-east-1 when none is set.
+    region = _configured_region() or "us-east-1"
+    result = run_aws([
+        "ec2", "describe-regions",
+        "--region", region,
+        "--query", "Regions[].RegionName",
+        "--output", "json",
+    ])
     return sorted(json.loads(result.stdout))
 
 
+# AWS region names: e.g. us-east-1, eu-central-1, ap-northeast-2, us-gov-east-1, cn-north-1.
+_REGION_NAME_RE = re.compile(r"^[a-z]{2,}(?:-[a-z]+)+-\d+$")
+
+
+def _configured_region() -> str | None:
+    """Return the region AWS CLI has resolved for the current env/profile, or None if unset.
+
+    Parses `aws configure list` because, unlike `aws configure get region`, it reflects env
+    vars (AWS_REGION, AWS_DEFAULT_REGION) in addition to the config file. Fails loudly if
+    the output format changes (column separator or value shape), rather than silently
+    misreading it.
+    """
+    # TODO should we switch to boto3 and make it sane?
+    result = run_aws(["configure", "list"])
+    for line in result.stdout.splitlines():
+        name, sep, rest = line.partition(":")
+        if name.strip() != "region":
+            continue
+        if not sep:
+            raise CloudvmError(
+                f"unexpected `aws configure list` row (no ':' separator): {line!r}"
+            )
+        value = rest.partition(":")[0].strip()
+        if value == "<not set>":
+            return None
+        if not _REGION_NAME_RE.match(value):
+            raise CloudvmError(
+                f"unexpected region value from `aws configure list`: {value!r}"
+            )
+        return value
+    raise CloudvmError("could not find 'region' row in `aws configure list` output")
+
+
 def _effective_region() -> str:
-    """Resolve the AWS region aws-cli would use when no --region is passed."""
-    region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
-    if region:
-        return region
-    result = run_aws(["configure", "get", "region"], check=False)
-    region = result.stdout.strip()
-    if not region:
+    """Return the AWS region in use."""
+    region = _configured_region()
+    if region is None:
         raise CloudvmError(
             "no AWS region configured (set AWS_REGION, AWS_DEFAULT_REGION, or `aws configure`)"
         )

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Unit tests for cloudvm. Run with: python3 -m unittest discover tests"""
 
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -265,6 +266,81 @@ class VersionStringTests(unittest.TestCase):
         with patch.object(_build_info, "COMMIT", "abc123def"), patch.object(_build_info, "DATE", "2026-06-03"):
             with patch.object(cb, "_installed_version", return_value="1.2.3"):
                 self.assertEqual(cb._version_string(), "cloudvm 1.2.3 (abc123def 2026-06-03)")
+
+
+def _fake_aws_configure_list(stdout: str):
+    """Return a side_effect for run_aws that returns `stdout` for `configure list`."""
+    def _run(args, **kwargs):
+        assert args[:2] == ["configure", "list"], args
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout=stdout, stderr="")
+    return _run
+
+
+CONFIGURE_LIST_CONFIG_FILE = """\
+      NAME       : VALUE                    : TYPE             : LOCATION
+profile    : <not set>                : None             : None
+access_key : <not set>                : None             : None
+secret_key : <not set>                : None             : None
+region     : us-east-1                : config-file      : ~/.aws/config
+"""
+
+CONFIGURE_LIST_ENV = """\
+      NAME       : VALUE                    : TYPE             : LOCATION
+profile    : <not set>                : None             : None
+access_key : <not set>                : None             : None
+secret_key : <not set>                : None             : None
+region     : eu-central-1             : env              : ['AWS_REGION', 'AWS_DEFAULT_REGION']
+"""
+
+CONFIGURE_LIST_NOT_SET = """\
+      NAME       : VALUE                    : TYPE             : LOCATION
+profile    : <not set>                : None             : None
+access_key : <not set>                : None             : None
+secret_key : <not set>                : None             : None
+region     : <not set>                : None             : None
+"""
+
+
+class ConfiguredRegionTests(unittest.TestCase):
+    def test_reads_region_from_config_file(self):
+        with patch.object(cb, "run_aws", side_effect=_fake_aws_configure_list(CONFIGURE_LIST_CONFIG_FILE)):
+            self.assertEqual(cb._configured_region(), "us-east-1")
+
+    def test_reads_region_from_env(self):
+        with patch.object(cb, "run_aws", side_effect=_fake_aws_configure_list(CONFIGURE_LIST_ENV)):
+            self.assertEqual(cb._configured_region(), "eu-central-1")
+
+    def test_returns_none_when_not_set(self):
+        with patch.object(cb, "run_aws", side_effect=_fake_aws_configure_list(CONFIGURE_LIST_NOT_SET)):
+            self.assertIsNone(cb._configured_region())
+
+    def test_accepts_gov_and_china_regions(self):
+        for region in ("us-gov-east-1", "us-gov-west-1", "cn-north-1", "cn-northwest-1", "ap-northeast-2"):
+            with self.subTest(region=region):
+                stdout = CONFIGURE_LIST_CONFIG_FILE.replace("us-east-1", region)
+                with patch.object(cb, "run_aws", side_effect=_fake_aws_configure_list(stdout)):
+                    self.assertEqual(cb._configured_region(), region)
+
+    def test_fails_loudly_when_separator_changes(self):
+        # Same data but with `|` instead of `:` — old code would silently misread.
+        stdout = CONFIGURE_LIST_CONFIG_FILE.replace(":", "|")
+        with patch.object(cb, "run_aws", side_effect=_fake_aws_configure_list(stdout)):
+            with self.assertRaises(cb.CloudvmError):
+                cb._configured_region()
+
+    def test_fails_loudly_on_unexpected_value(self):
+        stdout = CONFIGURE_LIST_CONFIG_FILE.replace("us-east-1", "EAST")
+        with patch.object(cb, "run_aws", side_effect=_fake_aws_configure_list(stdout)):
+            with self.assertRaises(cb.CloudvmError):
+                cb._configured_region()
+
+    def test_fails_when_region_row_missing(self):
+        stdout = "\n".join(
+            line for line in CONFIGURE_LIST_CONFIG_FILE.splitlines() if not line.startswith("region")
+        )
+        with patch.object(cb, "run_aws", side_effect=_fake_aws_configure_list(stdout)):
+            with self.assertRaises(cb.CloudvmError):
+                cb._configured_region()
 
 
 if __name__ == "__main__":
