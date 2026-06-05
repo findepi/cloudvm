@@ -43,4 +43,4 @@ alias at the new IP.
 
 ## License
 
-Apache-2.0
+Apache License 2.0
