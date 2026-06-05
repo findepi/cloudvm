@@ -16,6 +16,8 @@ from collections.abc import Callable
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
+import argcomplete
+
 from cloudvm import _build_info
 
 
@@ -550,12 +552,27 @@ def _version_string() -> str:
     return f"cloudvm {version_string} ({commit} {date})"
 
 
+class _PrintCompletionAction(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        print(argcomplete.shellcode(["cloudvm"], shell=values or "bash"))
+        parser.exit()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cloudvm",
         description="Manage cloud development instances. Currently AWS EC2 is supported.",
     )
     parser.add_argument("--version", action="version", version=_version_string())
+    parser.add_argument(
+        "--print-completion",
+        action=_PrintCompletionAction,
+        nargs="?",
+        const="bash",
+        choices=("bash", "zsh", "tcsh", "fish"),
+        metavar="SHELL",
+        help="print shell completion code and exit (default: bash)",
+    )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     up = sub.add_parser("up", help="ensure SSO + start instance + print public IP")
@@ -589,6 +606,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
+    argcomplete.autocomplete(parser)
     args = parser.parse_args(argv)
     try:
         return args.func(args)

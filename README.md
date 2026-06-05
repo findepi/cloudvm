@@ -41,6 +41,18 @@ usual AWS environment variables (`AWS_REGION`, `AWS_PROFILE`, ...).
 Pass `--update-ssh` to `up` to point the matching `~/.ssh/config` host
 alias at the new IP.
 
+## Shell completion
+
+To enable tab-completion, add this to your `~/.bashrc` (or `~/.zshrc`,
+after `compinit`):
+
+```bash
+eval "$(cloudvm --print-completion bash)"   # or: zsh / tcsh / fish
+```
+
+Then open a new shell, or `source` the rc file. `cloudvm <TAB>` will now
+complete subcommands and flags.
+
 ## License
 
 Apache License 2.0
