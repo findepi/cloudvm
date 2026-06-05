@@ -52,7 +52,7 @@ build = ["hatchling"]
 required-version = "==0.11.18"
 
 [tool.hatch.build.targets.wheel]
-only-include = ["cloudvm.py"]
+only-include = ["cloudvm"]
 
 [tool.hatch.build.targets.sdist]
-include = ["cloudvm.py", "tests/", "README.md", "LICENSE", "pyproject.toml"]
+include = ["cloudvm/", "tests/", "README.md", "LICENSE", "pyproject.toml"]

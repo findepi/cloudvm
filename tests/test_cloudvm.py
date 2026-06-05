@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-import cloudvm as cb  # noqa: E402
+from cloudvm import _cli as cb  # noqa: E402
 
 
 SAMPLE_CONFIG = """\
