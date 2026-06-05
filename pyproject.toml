@@ -45,11 +45,17 @@ cloudvm = "cloudvm:main"
 # same backend so non-uv frontends (e.g. `python -m build` from a source
 # checkout) still work.
 build = ["hatchling"]
+dev = [
+    "ruff>=0.15.16",
+]
 
 [tool.uv]
 # Single source of truth for the uv version used in CI. setup-uv reads
 # `required-version` from this file automatically.
 required-version = "==0.11.18"
+
+[tool.ruff]
+line-length = 120
 
 [tool.hatch.build.targets.wheel]
 only-include = ["cloudvm"]

@@ -29,6 +29,9 @@ jobs:
       - name: Sync project from lockfile
         run: uv sync --locked --python ${{ matrix.python-version }}
 
+      - name: Lint
+        run: uv run ruff check
+
       - name: Run tests
         run: uv run python -m unittest discover tests -v
 
@@ -39,7 +42,6 @@ jobs:
         # write, the hash-pinned --no-build-isolation build, and that
         # the entry point in the resulting wheel reports the version and
         # build metadata that were set.
-        if: matrix.python-version == '3.12'
         run: |
           uv version 1.2.3.4.5
           cat > cloudvm/_build_info.py <<EOF
