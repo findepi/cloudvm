@@ -352,5 +352,66 @@ class CompleteRegionTests(unittest.TestCase):
             self.assertEqual(cb._complete_region(prefix="eu-"), [])
 
 
+class CompleteInstanceNameTests(unittest.TestCase):
+    def test_uses_explicit_region_over_configured(self):
+        seen = {}
+
+        def fake_list_in_region(name, region):
+            seen["region"] = region
+            return [[region, "findepi-dev", "running", "1.2.3.4"]]
+
+        with (
+            patch.object(cb, "_list_in_region", side_effect=fake_list_in_region),
+            patch.object(cb, "_configured_region", return_value="us-east-1"),
+        ):
+            out = cb._complete_instance_name(prefix="", parsed_args=argparse.Namespace(region="eu-central-1"))
+        self.assertEqual(out, ["findepi-dev"])
+        self.assertEqual(seen["region"], "eu-central-1")
+
+    def test_falls_back_to_configured_region(self):
+        seen = {}
+
+        def fake_list_in_region(name, region):
+            seen["region"] = region
+            return [[region, "box", "stopped", "-"]]
+
+        with (
+            patch.object(cb, "_list_in_region", side_effect=fake_list_in_region),
+            patch.object(cb, "_configured_region", return_value="eu-west-1"),
+        ):
+            out = cb._complete_instance_name(prefix="", parsed_args=argparse.Namespace(region=None))
+        self.assertEqual(out, ["box"])
+        self.assertEqual(seen["region"], "eu-west-1")
+
+    def test_returns_empty_when_no_region_available(self):
+        with (
+            patch.object(cb, "_configured_region", return_value=None),
+            patch.object(cb, "_list_in_region") as list_mock,
+        ):
+            out = cb._complete_instance_name(prefix="", parsed_args=argparse.Namespace(region=None))
+        self.assertEqual(out, [])
+        list_mock.assert_not_called()
+
+    def test_sorts_dedupes_and_drops_empty_names(self):
+        rows = [
+            ["eu-central-1", "zeta", "running", "1.1.1.1"],
+            ["eu-central-1", "alpha", "stopped", "-"],
+            ["eu-central-1", "alpha", "running", "2.2.2.2"],
+            ["eu-central-1", "", "stopped", "-"],
+        ]
+        with patch.object(cb, "_list_in_region", return_value=rows):
+            out = cb._complete_instance_name(prefix="", parsed_args=argparse.Namespace(region="eu-central-1"))
+        self.assertEqual(out, ["alpha", "zeta"])
+
+    def test_swallows_exceptions(self):
+        with patch.object(cb, "_list_in_region", side_effect=RuntimeError("boom")):
+            out = cb._complete_instance_name(prefix="", parsed_args=argparse.Namespace(region="eu-central-1"))
+        self.assertEqual(out, [])
+
+    def test_handles_missing_parsed_args(self):
+        with patch.object(cb, "_configured_region", return_value=None):
+            self.assertEqual(cb._complete_instance_name(prefix="", parsed_args=None), [])
+
+
 if __name__ == "__main__":
     unittest.main()

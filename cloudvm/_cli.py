@@ -566,6 +566,17 @@ def _complete_region(prefix, **kwargs):
         return []
 
 
+def _complete_instance_name(prefix, parsed_args=None, **kwargs):
+    try:
+        region = getattr(parsed_args, "region", None) or _configured_region()
+        if not region:
+            return []
+        rows = _list_in_region("*", region)
+        return sorted({row[1] for row in rows if row[1]})
+    except Exception:
+        return []
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cloudvm",
@@ -584,7 +595,9 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     up = sub.add_parser("up", help="ensure SSO + start instance + print public IP")
-    up.add_argument("--name", "-n", required=True, help="EC2 Name tag of the instance")
+    up.add_argument(
+        "--name", "-n", required=True, help="EC2 Name tag of the instance"
+    ).completer = _complete_instance_name
     up.add_argument(
         "--region", "-r", default=None, help="AWS region; omit to let aws-cli use its own default"
     ).completer = _complete_region
@@ -595,7 +608,9 @@ def build_parser() -> argparse.ArgumentParser:
     up.set_defaults(func=cmd_up)
 
     down = sub.add_parser("down", help="trigger stop on a running instance (does not wait for fully stopped)")
-    down.add_argument("--name", "-n", required=True, help="EC2 Name tag of the instance")
+    down.add_argument(
+        "--name", "-n", required=True, help="EC2 Name tag of the instance"
+    ).completer = _complete_instance_name
     down.add_argument(
         "--region", "-r", default=None, help="AWS region; omit to let aws-cli use its own default"
     ).completer = _complete_region
