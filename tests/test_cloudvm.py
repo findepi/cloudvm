@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Unit tests for cloudvm. Run with: python3 -m unittest discover tests"""
 
+import argparse
 import subprocess
 import sys
 import tempfile
@@ -339,6 +340,16 @@ class ConfiguredRegionTests(unittest.TestCase):
         with patch.object(cb, "run_aws", side_effect=_fake_aws_configure_list(stdout)):
             with self.assertRaises(cb.CloudvmError):
                 cb._configured_region()
+
+
+class CompleteRegionTests(unittest.TestCase):
+    def test_returns_regions(self):
+        with patch.object(cb, "list_aws_regions", return_value=["eu-central-1", "us-east-1"]):
+            self.assertEqual(cb._complete_region(prefix="eu-"), ["eu-central-1", "us-east-1"])
+
+    def test_swallows_exceptions(self):
+        with patch.object(cb, "list_aws_regions", side_effect=RuntimeError("boom")):
+            self.assertEqual(cb._complete_region(prefix="eu-"), [])
 
 
 if __name__ == "__main__":
