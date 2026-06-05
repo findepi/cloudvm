@@ -395,6 +395,20 @@ def list_aws_regions() -> list[str]:
     return sorted(json.loads(result.stdout))
 
 
+def _effective_region() -> str:
+    """Resolve the AWS region aws-cli would use when no --region is passed."""
+    region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
+    if region:
+        return region
+    result = run_aws(["configure", "get", "region"], check=False)
+    region = result.stdout.strip()
+    if not region:
+        raise CloudvmError(
+            "no AWS region configured (set AWS_REGION, AWS_DEFAULT_REGION, or `aws configure`)"
+        )
+    return region
+
+
 def format_table(headers: list[str], rows: list[list[str]],
                  col_wrappers: list[Callable[[str], str] | None] | None = None) -> str:
     """Format a left-aligned text table. Width is computed from raw cell strings;
@@ -420,10 +434,10 @@ def format_table(headers: list[str], rows: list[list[str]],
     ])
 
 
-def _list_in_region(name_pattern: str, region: str | None) -> list[list[str]]:
+def _list_in_region(name_pattern: str, region: str) -> list[list[str]]:
     result = run_aws([
         "ec2", "describe-instances",
-        *_region_args(region),
+        "--region", region,
         "--filters",
         f"Name=tag:Name,Values={name_pattern}",
         "Name=instance-state-name,Values=pending,running,stopping,stopped",
@@ -436,7 +450,7 @@ def _list_in_region(name_pattern: str, region: str | None) -> list[list[str]]:
             name = next((t["Value"] for t in inst.get("Tags", []) if t["Key"] == "Name"), "")
             state = inst["State"]["Name"]
             ip = inst.get("PublicIpAddress") or "-"
-            rows.append([name, state, ip])
+            rows.append([region, name, state, ip])
     return rows
 
 
@@ -456,14 +470,15 @@ def cmd_list(args: argparse.Namespace) -> int:
         for region in regions:
             rows.extend(_list_in_region(name_pattern, region))
     else:
-        rows.extend(_list_in_region(name_pattern, None))
+        rows.extend(_list_in_region(name_pattern, _effective_region()))
 
     if not rows:
         print("(no instances match)")
         return 0
 
-    rows.sort(key=lambda r: (r[0], r[1]))
-    print(format_table(["name", "status", "public IP"], rows, col_wrappers=[None, _hl, None]))
+    rows.sort(key=lambda r: (r[0], r[1], r[2]))
+    print(format_table(["region", "name", "status", "public IP"], rows,
+                       col_wrappers=[None, None, _hl, None]))
     return 0
 
 
