@@ -47,11 +47,37 @@ To enable tab-completion, add this to your `~/.bashrc` (or `~/.zshrc`,
 after `compinit`):
 
 ```bash
+# This spawns cloudvm once for every new shell. See below for optimized
+# alternative.
 eval "$(cloudvm --print-completion bash)"   # or: zsh / tcsh / fish
 ```
 
 Then open a new shell, or `source` the rc file. `cloudvm <TAB>` will now
 complete subcommands and flags.
+
+To skip the per-shell `cloudvm` spawn, use a lazy stub instead — it
+loads the real completion on first use.
+
+bash (`~/.bashrc`):
+
+```bash
+_cloudvm_lazy_complete() {
+    eval "$(cloudvm --print-completion bash)"
+    return 124
+}
+complete -F _cloudvm_lazy_complete cloudvm
+```
+
+zsh (`~/.zshrc`, after `compinit`):
+
+```zsh
+_cloudvm_lazy_complete() {
+    unfunction _cloudvm_lazy_complete
+    eval "$(cloudvm --print-completion zsh)"
+    "${_comps[cloudvm]}" "$@"
+}
+compdef _cloudvm_lazy_complete cloudvm
+```
 
 ## License
 
