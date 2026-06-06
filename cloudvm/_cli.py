@@ -12,6 +12,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any, NoReturn
@@ -453,6 +454,34 @@ def match_globs(values: list[str], patterns: list[str]) -> list[str]:
     return matched
 
 
+def _has_wildcard(pattern: str) -> bool:
+    """True if `pattern` contains any fnmatch metacharacter."""
+    return any(c in pattern for c in "*?[")
+
+
+def _resolve_regions(region_args: list[str] | None) -> list[str]:
+    """Resolve the `--region` CLI argument(s) to the concrete list of regions to query.
+
+    `region_args` is the raw argparse value (list because `--region` is repeatable, or
+    None when not passed). Comma-separated tokens are split. When nothing is supplied,
+    fall back to the session's effective region.
+
+    When any pattern has wildcards, enumerate live regions via `describe_regions` and
+    glob-match. Otherwise patterns are literal — return them directly, deduplicated,
+    preserving order (skips the API call).
+    """
+    patterns = _split_csv(region_args) if region_args else []
+    if not patterns:
+        return [_effective_region()]
+    if any(_has_wildcard(p) for p in patterns):
+        all_regions = list_aws_regions()
+        matched = match_globs(all_regions, patterns)
+        if not matched:
+            raise CloudvmError(f"no AWS regions match {patterns!r} (available: {len(all_regions)} regions)")
+        return matched
+    return list(set(patterns))
+
+
 def list_aws_regions() -> list[str]:
     # `describe-regions` is itself a regional API and needs a region for endpoint resolution.
     # Prefer the session's configured region; us-east-1 is a safe fallback since the response
@@ -524,18 +553,10 @@ def _list_in_region(name_pattern: str, region: str) -> list[list[str]]:
 
 def cmd_list(args: argparse.Namespace) -> int:
     name_pattern = args.name  # AWS filter natively supports * and ? wildcards
-    rows: list[list[str]] = []
+    regions = _resolve_regions(args.region)
 
-    if args.region:
-        region_patterns = _split_csv(args.region)
-        all_regions = list_aws_regions()
-        regions = match_globs(all_regions, region_patterns)
-        if not regions:
-            raise CloudvmError(f"no AWS regions match {region_patterns!r} (available: {len(all_regions)} regions)")
-        for region in regions:
-            rows.extend(_list_in_region(name_pattern, region))
-    else:
-        rows.extend(_list_in_region(name_pattern, _effective_region()))
+    with ThreadPoolExecutor(max_workers=len(regions)) as ex:
+        rows = [row for chunk in ex.map(lambda r: _list_in_region(name_pattern, r), regions) for row in chunk]
 
     if not rows:
         print("(no instances match)")

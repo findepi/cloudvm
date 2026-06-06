@@ -190,6 +190,101 @@ class RegionGlobTests(unittest.TestCase):
         self.assertEqual(cb.match_globs(regions, ["us-east-?"]), ["us-east-1", "us-east-2"])
 
 
+class HasWildcardTests(unittest.TestCase):
+    def test_literal(self):
+        self.assertFalse(cb._has_wildcard("us-east-1"))
+        self.assertFalse(cb._has_wildcard(""))
+
+    def test_star(self):
+        self.assertTrue(cb._has_wildcard("us-*"))
+        self.assertTrue(cb._has_wildcard("*"))
+
+    def test_question_mark(self):
+        self.assertTrue(cb._has_wildcard("us-east-?"))
+
+    def test_bracket_class(self):
+        self.assertTrue(cb._has_wildcard("us-[ew]ast-1"))
+
+
+class ResolveRegionsTests(unittest.TestCase):
+    """`_resolve_regions` owns the CLI-arg → region-list mapping: split, fallback, expand."""
+
+    def test_none_falls_back_to_effective_region(self):
+        with (
+            patch.object(cb, "_effective_region", return_value="eu-central-1") as eff,
+            patch.object(cb, "list_aws_regions") as lr,
+        ):
+            self.assertEqual(cb._resolve_regions(None), ["eu-central-1"])
+        eff.assert_called_once_with()
+        lr.assert_not_called()
+
+    def test_empty_list_falls_back_to_effective_region(self):
+        with (
+            patch.object(cb, "_effective_region", return_value="eu-central-1"),
+            patch.object(cb, "list_aws_regions") as lr,
+        ):
+            self.assertEqual(cb._resolve_regions([]), ["eu-central-1"])
+        lr.assert_not_called()
+
+    def test_all_literal_skips_describe_regions(self):
+        with patch.object(cb, "list_aws_regions") as lr:
+            self.assertEqual(
+                set(cb._resolve_regions(["us-east-1,eu-central-1"])),
+                {"us-east-1", "eu-central-1"},
+            )
+        lr.assert_not_called()
+
+    def test_all_literal_dedupes(self):
+        with patch.object(cb, "list_aws_regions") as lr:
+            self.assertEqual(
+                set(cb._resolve_regions(["us-east-1", "eu-central-1", "us-east-1"])),
+                {"us-east-1", "eu-central-1"},
+            )
+        lr.assert_not_called()
+
+    def test_wildcard_enumerates_and_globs(self):
+        with patch.object(cb, "list_aws_regions", return_value=["eu-central-1", "us-east-1", "us-west-2"]) as lr:
+            self.assertEqual(cb._resolve_regions(["us-*"]), ["us-east-1", "us-west-2"])
+        lr.assert_called_once_with()
+
+    def test_mixed_literal_and_wildcard_enumerates(self):
+        # As soon as one pattern has wildcards we must enumerate, so the literal also goes
+        # through `match_globs` (validating it exists).
+        with patch.object(cb, "list_aws_regions", return_value=["eu-central-1", "us-east-1"]) as lr:
+            self.assertEqual(
+                sorted(cb._resolve_regions(["us-east-1", "eu-*"])),
+                ["eu-central-1", "us-east-1"],
+            )
+        lr.assert_called_once_with()
+
+    def test_wildcard_no_matches_raises(self):
+        with patch.object(cb, "list_aws_regions", return_value=["us-east-1", "eu-central-1"]):
+            with self.assertRaises(cb.CloudvmError):
+                cb._resolve_regions(["af-*"])
+
+
+class CmdListTests(unittest.TestCase):
+    @staticmethod
+    def _args(region):
+        return argparse.Namespace(region=region, name="*")
+
+    def test_per_region_calls_are_concurrent(self):
+        """ThreadPoolExecutor must actually overlap the calls — verify by holding each call
+        on a barrier that only releases once all workers have entered."""
+        import threading
+
+        regions_in = ["us-east-1", "eu-central-1", "ap-south-1"]
+        barrier = threading.Barrier(len(regions_in), timeout=2.0)
+
+        def slow(name, region):
+            barrier.wait()  # blocks until all 3 workers arrive — proves concurrency
+            return [[region, "x", "running", "1.1.1.1"]]
+
+        with patch.object(cb, "_list_in_region", side_effect=slow):
+            rc = cb.cmd_list(self._args([",".join(regions_in)]))
+        self.assertEqual(rc, 0)
+
+
 class FormatTableTests(unittest.TestCase):
     def test_basic_table(self):
         out = cb.format_table(
