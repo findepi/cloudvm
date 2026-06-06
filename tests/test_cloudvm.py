@@ -2,12 +2,13 @@
 """Unit tests for cloudvm. Run with: python3 -m unittest discover tests"""
 
 import argparse
-import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
+
+import botocore.exceptions
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from cloudvm import _build_info, _cli as cb  # noqa: E402
@@ -267,81 +268,6 @@ class VersionStringTests(unittest.TestCase):
                 self.assertEqual(cb._version_string(), "cloudvm 1.2.3 (abc123def 2026-06-03)")
 
 
-def _fake_aws_configure_list(stdout: str):
-    """Return a side_effect for run_aws that returns `stdout` for `configure list`."""
-
-    def _run(args, **kwargs):
-        assert args[:2] == ["configure", "list"], args
-        return subprocess.CompletedProcess(args=args, returncode=0, stdout=stdout, stderr="")
-
-    return _run
-
-
-CONFIGURE_LIST_CONFIG_FILE = """\
-      NAME       : VALUE                    : TYPE             : LOCATION
-profile    : <not set>                : None             : None
-access_key : <not set>                : None             : None
-secret_key : <not set>                : None             : None
-region     : us-east-1                : config-file      : ~/.aws/config
-"""
-
-CONFIGURE_LIST_ENV = """\
-      NAME       : VALUE                    : TYPE             : LOCATION
-profile    : <not set>                : None             : None
-access_key : <not set>                : None             : None
-secret_key : <not set>                : None             : None
-region     : eu-central-1             : env              : ['AWS_REGION', 'AWS_DEFAULT_REGION']
-"""
-
-CONFIGURE_LIST_NOT_SET = """\
-      NAME       : VALUE                    : TYPE             : LOCATION
-profile    : <not set>                : None             : None
-access_key : <not set>                : None             : None
-secret_key : <not set>                : None             : None
-region     : <not set>                : None             : None
-"""
-
-
-class ConfiguredRegionTests(unittest.TestCase):
-    def test_reads_region_from_config_file(self):
-        with patch.object(cb, "run_aws", side_effect=_fake_aws_configure_list(CONFIGURE_LIST_CONFIG_FILE)):
-            self.assertEqual(cb._configured_region(), "us-east-1")
-
-    def test_reads_region_from_env(self):
-        with patch.object(cb, "run_aws", side_effect=_fake_aws_configure_list(CONFIGURE_LIST_ENV)):
-            self.assertEqual(cb._configured_region(), "eu-central-1")
-
-    def test_returns_none_when_not_set(self):
-        with patch.object(cb, "run_aws", side_effect=_fake_aws_configure_list(CONFIGURE_LIST_NOT_SET)):
-            self.assertIsNone(cb._configured_region())
-
-    def test_accepts_gov_and_china_regions(self):
-        for region in ("us-gov-east-1", "us-gov-west-1", "cn-north-1", "cn-northwest-1", "ap-northeast-2"):
-            with self.subTest(region=region):
-                stdout = CONFIGURE_LIST_CONFIG_FILE.replace("us-east-1", region)
-                with patch.object(cb, "run_aws", side_effect=_fake_aws_configure_list(stdout)):
-                    self.assertEqual(cb._configured_region(), region)
-
-    def test_fails_loudly_when_separator_changes(self):
-        # Same data but with `|` instead of `:` — old code would silently misread.
-        stdout = CONFIGURE_LIST_CONFIG_FILE.replace(":", "|")
-        with patch.object(cb, "run_aws", side_effect=_fake_aws_configure_list(stdout)):
-            with self.assertRaises(cb.CloudvmError):
-                cb._configured_region()
-
-    def test_fails_loudly_on_unexpected_value(self):
-        stdout = CONFIGURE_LIST_CONFIG_FILE.replace("us-east-1", "EAST")
-        with patch.object(cb, "run_aws", side_effect=_fake_aws_configure_list(stdout)):
-            with self.assertRaises(cb.CloudvmError):
-                cb._configured_region()
-
-    def test_fails_when_region_row_missing(self):
-        stdout = "\n".join(line for line in CONFIGURE_LIST_CONFIG_FILE.splitlines() if not line.startswith("region"))
-        with patch.object(cb, "run_aws", side_effect=_fake_aws_configure_list(stdout)):
-            with self.assertRaises(cb.CloudvmError):
-                cb._configured_region()
-
-
 class CompleteRegionTests(unittest.TestCase):
     def test_returns_regions(self):
         with patch.object(cb, "list_aws_regions", return_value=["eu-central-1", "us-east-1"]):
@@ -411,6 +337,141 @@ class CompleteInstanceNameTests(unittest.TestCase):
     def test_handles_missing_parsed_args(self):
         with patch.object(cb, "_configured_region", return_value=None):
             self.assertEqual(cb._complete_instance_name(prefix="", parsed_args=None), [])
+
+
+class IsExpiredCredentialsTests(unittest.TestCase):
+    def test_sso_token_load_error(self):
+        self.assertTrue(cb._is_expired_credentials(botocore.exceptions.SSOTokenLoadError(error_msg="x")))
+
+    def test_unauthorized_sso_token_error(self):
+        self.assertTrue(cb._is_expired_credentials(botocore.exceptions.UnauthorizedSSOTokenError()))
+
+    def test_token_retrieval_error(self):
+        self.assertTrue(
+            cb._is_expired_credentials(botocore.exceptions.TokenRetrievalError(provider="sso", error_msg="x"))
+        )
+
+    def test_client_error_expired_token(self):
+        for code in ("ExpiredToken", "ExpiredTokenException", "RequestExpired"):
+            with self.subTest(code=code):
+                err = botocore.exceptions.ClientError({"Error": {"Code": code, "Message": "m"}}, "DescribeInstances")
+                self.assertTrue(cb._is_expired_credentials(err))
+
+    def test_client_error_other_codes_are_not_expired(self):
+        for code in ("AccessDenied", "UnauthorizedOperation", "InvalidInstanceID.NotFound"):
+            with self.subTest(code=code):
+                err = botocore.exceptions.ClientError({"Error": {"Code": code, "Message": "m"}}, "DescribeInstances")
+                self.assertFalse(cb._is_expired_credentials(err))
+
+    def test_waiter_error_with_expired_token(self):
+        for code in ("ExpiredToken", "ExpiredTokenException", "RequestExpired"):
+            with self.subTest(code=code):
+                err = botocore.exceptions.WaiterError(
+                    name="instance_running",
+                    reason=f"An error occurred ({code})",
+                    last_response={"Error": {"Code": code, "Message": "m"}},
+                )
+                self.assertTrue(cb._is_expired_credentials(err))
+
+    def test_waiter_error_with_other_code_is_not_expired(self):
+        err = botocore.exceptions.WaiterError(
+            name="instance_running",
+            reason="Max attempts exceeded",
+            last_response={"Reservations": []},
+        )
+        self.assertFalse(cb._is_expired_credentials(err))
+
+    def test_unrelated_exception(self):
+        self.assertFalse(cb._is_expired_credentials(ValueError("nope")))
+        self.assertFalse(cb._is_expired_credentials(RuntimeError("nope")))
+
+
+class SsoLoginTests(unittest.TestCase):
+    """Validate that `_sso_login` shells out to `aws sso login` and clears the session cache."""
+
+    def test_invokes_aws_sso_login_subprocess(self):
+        # Seed the session/client cache so we can assert it gets cleared.
+        cb._session = object()
+        cb._clients["us-east-1"] = object()
+        with patch.object(cb.subprocess, "run") as run:
+            run.return_value = MagicMock(returncode=0)
+            cb._sso_login()
+        run.assert_called_once_with(["aws", "sso", "login"])
+        self.assertIsNone(cb._session)
+        self.assertEqual(cb._clients, {})
+
+    def test_raises_when_aws_sso_login_fails(self):
+        with patch.object(cb.subprocess, "run") as run:
+            run.return_value = MagicMock(returncode=2)
+            with self.assertRaises(cb.CloudvmError):
+                cb._sso_login()
+
+
+class AwsCallRetryTests(unittest.TestCase):
+    """Validate `_aws_call`: SSO login fires iff the first call raises an expired-token error."""
+
+    def test_no_error_does_not_invoke_sso_login(self):
+        fn = MagicMock(return_value="ok")
+        with patch.object(cb, "_sso_login") as login:
+            self.assertEqual(cb._aws_call(fn), "ok")
+        fn.assert_called_once_with()
+        login.assert_not_called()
+
+    def test_non_sso_error_propagates_without_login(self):
+        boom = RuntimeError("network broke")
+        fn = MagicMock(side_effect=boom)
+        with patch.object(cb, "_sso_login") as login:
+            with self.assertRaises(RuntimeError):
+                cb._aws_call(fn)
+        fn.assert_called_once_with()
+        login.assert_not_called()
+
+    def test_client_error_with_non_expired_code_is_wrapped_without_login(self):
+        err = botocore.exceptions.ClientError(
+            {"Error": {"Code": "InvalidInstanceID.NotFound", "Message": "m"}}, "DescribeInstances"
+        )
+        fn = MagicMock(side_effect=err)
+        with patch.object(cb, "_sso_login") as login:
+            with self.assertRaises(cb.CloudvmError):
+                cb._aws_call(fn)
+        fn.assert_called_once_with()
+        login.assert_not_called()
+
+    def test_botocore_error_is_wrapped_without_login(self):
+        # NoRegionError is a BotoCoreError (not a ClientError) — verifies the BotoCoreError branch.
+        err = botocore.exceptions.NoRegionError()
+        fn = MagicMock(side_effect=err)
+        with patch.object(cb, "_sso_login") as login:
+            with self.assertRaises(cb.CloudvmError):
+                cb._aws_call(fn)
+        fn.assert_called_once_with()
+        login.assert_not_called()
+
+    def test_sso_error_triggers_login_and_retries(self):
+        first = botocore.exceptions.SSOTokenLoadError(error_msg="expired")
+        fn = MagicMock(side_effect=[first, "ok"])
+        with patch.object(cb, "_sso_login") as login:
+            self.assertEqual(cb._aws_call(fn), "ok")
+        self.assertEqual(fn.call_count, 2)
+        login.assert_called_once_with()
+
+    def test_expired_token_client_error_triggers_login_and_retries(self):
+        err = botocore.exceptions.ClientError({"Error": {"Code": "ExpiredToken", "Message": "m"}}, "DescribeInstances")
+        fn = MagicMock(side_effect=[err, {"Reservations": []}])
+        with patch.object(cb, "_sso_login") as login:
+            self.assertEqual(cb._aws_call(fn), {"Reservations": []})
+        self.assertEqual(fn.call_count, 2)
+        login.assert_called_once_with()
+
+    def test_retry_only_happens_once(self):
+        """If the call still fails after login, the second failure propagates — no infinite loop."""
+        err = botocore.exceptions.SSOTokenLoadError(error_msg="still bad")
+        fn = MagicMock(side_effect=err)
+        with patch.object(cb, "_sso_login") as login:
+            with self.assertRaises(cb.CloudvmError):
+                cb._aws_call(fn)
+        self.assertEqual(fn.call_count, 2)
+        login.assert_called_once_with()
 
 
 if __name__ == "__main__":

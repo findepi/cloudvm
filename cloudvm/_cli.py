@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
-import json
 import os
 import re
 import shutil
@@ -15,6 +14,7 @@ import time
 from collections.abc import Callable
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
+from typing import Any, NoReturn
 
 import argcomplete
 
@@ -33,22 +33,101 @@ class CloudvmError(Exception):
     """Expected failures — printed without a traceback."""
 
 
-def run_aws(args: list[str], *, check: bool = True, capture: bool = True) -> subprocess.CompletedProcess:
-    cmd = ["aws", *args]
-    result = subprocess.run(
-        cmd,
-        capture_output=capture,
-        text=True,
-    )
-    if check and result.returncode != 0:
-        stderr = (result.stderr or "").strip()
-        raise CloudvmError(f"`{' '.join(cmd)}` failed: {stderr or 'exit ' + str(result.returncode)}")
-    return result
+# boto3 is imported lazily so `--print-completion` is as fast as possible
+_session: Any = None
+_clients: dict[str | None, Any] = {}
 
 
-def _region_args(region: str | None) -> list[str]:
-    """Render --region for aws-cli when explicit; empty list otherwise (let aws-cli pick)."""
-    return ["--region", region] if region else []
+def _get_session() -> Any:
+    global _session
+    if _session is None:
+        import boto3
+
+        _session = boto3.Session()
+    return _session
+
+
+def _reset_session() -> None:
+    """Drop the cached session/clients so the next call re-reads credentials.
+
+    Used after `aws sso login` finishes — the on-disk token cache is fresh, but
+    a previously-built session may have memoized the failing state.
+    """
+    global _session
+    _session = None
+    _clients.clear()
+
+
+def _ec2(region: str | None = None):
+    if region not in _clients:
+        kwargs = {"region_name": region} if region else {}
+        _clients[region] = _get_session().client("ec2", **kwargs)
+    return _clients[region]
+
+
+_EXPIRED_TOKEN_CODES = ("ExpiredToken", "ExpiredTokenException", "RequestExpired")
+
+
+def _is_expired_credentials(exc: BaseException) -> bool:
+    import botocore.exceptions as bex
+
+    # Botocore exceptions that mean "the cached SSO token isn't usable" — `aws sso login` fixes them.
+    if isinstance(exc, (bex.SSOTokenLoadError, bex.UnauthorizedSSOTokenError, bex.TokenRetrievalError)):
+        return True
+    if isinstance(exc, bex.ClientError):
+        code = exc.response.get("Error", {}).get("Code", "")
+        return code in _EXPIRED_TOKEN_CODES
+    # A token expiry mid-`wait()` surfaces as ClientError most of the time, but some waiter
+    # configurations bubble it up wrapped as WaiterError with the response stashed away.
+    if isinstance(exc, bex.WaiterError):
+        last = getattr(exc, "last_response", None) or {}
+        code = last.get("Error", {}).get("Code", "") if isinstance(last, dict) else ""
+        return code in _EXPIRED_TOKEN_CODES
+    return False
+
+
+def _raise_as_cloudvm(exc: BaseException) -> NoReturn:
+    """Wrap botocore errors as CloudvmError so `main()` prints them without a traceback.
+
+    Other exceptions are re-raised unchanged.
+    """
+    import botocore.exceptions as bex
+
+    if isinstance(exc, (bex.BotoCoreError, bex.ClientError)):
+        raise CloudvmError(str(exc)) from exc
+    raise exc
+
+
+def _sso_login() -> None:
+    print("SSO token expired or missing; running `aws sso login` ...")
+    # Inherit stdio so the browser-handoff messages reach the user's terminal.
+    result = subprocess.run(["aws", "sso", "login"])
+    if result.returncode != 0:
+        raise CloudvmError(f"`aws sso login` failed with exit {result.returncode}")
+    _reset_session()
+
+
+def _aws_call(fn: Callable[[], Any]) -> Any:
+    """Run a single AWS API call, refreshing SSO once on token errors before retrying.
+
+    Botocore errors are converted to CloudvmError so `main()` prints them as `error: ...`
+    instead of a Python traceback. Non-AWS exceptions propagate unchanged.
+
+    Scoping the retry to one call (rather than the whole command) means a token expiry
+    encountered mid-command doesn't replay prints or already-applied AWS state changes.
+    `fn` should re-resolve its client (via `_ec2(region)`) so the retry picks up the
+    rebuilt session after `_sso_login()` clears the cache.
+    """
+    try:
+        return fn()
+    except Exception as exc:
+        if not _is_expired_credentials(exc):
+            _raise_as_cloudvm(exc)
+    _sso_login()
+    try:
+        return fn()
+    except Exception as exc:
+        _raise_as_cloudvm(exc)
 
 
 def _hl(text: str) -> str:
@@ -58,32 +137,17 @@ def _hl(text: str) -> str:
     return f"\033[38;5;75m{text}\033[0m"
 
 
-def ensure_sso() -> None:
-    """Refresh SSO only when the cached token is actually expired."""
-    probe = run_aws(["sts", "get-caller-identity", "--output", "text"], check=False)
-    if probe.returncode == 0:
-        return
-    print("SSO token expired or missing; running `aws sso login` ...")
-    # No capture: let the browser-handoff messages reach the user's terminal.
-    run_aws(["sso", "login"], capture=False)
-
-
 def describe_instance(name: str, region: str | None = None) -> dict:
     """Return the single instance matching tag:Name=<name> (excluding terminated/shutting-down)."""
-    result = run_aws(
-        [
-            "ec2",
-            "describe-instances",
-            *_region_args(region),
-            "--filters",
-            f"Name=tag:Name,Values={name}",
-            "Name=instance-state-name,Values=pending,running,stopping,stopped",
-            "--output",
-            "json",
-        ]
+    resp = _aws_call(
+        lambda: _ec2(region).describe_instances(
+            Filters=[
+                {"Name": "tag:Name", "Values": [name]},
+                {"Name": "instance-state-name", "Values": ["pending", "running", "stopping", "stopped"]},
+            ],
+        )
     )
-    data = json.loads(result.stdout)
-    instances = [i for r in data.get("Reservations", []) for i in r.get("Instances", [])]
+    instances = [i for r in resp.get("Reservations", []) for i in r.get("Instances", [])]
     if not instances:
         where = f"region {region}" if region else "the current AWS context"
         raise CloudvmError(f"no instance with tag Name={name!r} in {where}")
@@ -98,23 +162,22 @@ def ensure_running(instance: dict, region: str | None = None) -> None:
 
     Each branch handles one state and its own wait, then advances `state` to the next
     state in the progression: stopping -> stopped -> pending -> running.
-    start-instances would otherwise refuse a stopping instance with IncorrectInstanceState.
+    start_instances would otherwise refuse a stopping instance with IncorrectInstanceState.
     """
     instance_id = instance["InstanceId"]
     state = instance["State"]["Name"]
-    region_args = _region_args(region)
 
     if state == "stopping":
         print(f"instance {instance_id} is {_hl('stopping')}; waiting for {_hl('stopped')} ...")
-        run_aws(["ec2", "wait", "instance-stopped", *region_args, "--instance-ids", instance_id])
+        _aws_call(lambda: _ec2(region).get_waiter("instance_stopped").wait(InstanceIds=[instance_id]))
         state = "stopped"
     if state == "stopped":
         print(f"instance {instance_id} is {_hl('stopped')}; starting ...")
-        run_aws(["ec2", "start-instances", *region_args, "--instance-ids", instance_id])
+        _aws_call(lambda: _ec2(region).start_instances(InstanceIds=[instance_id]))
         state = "pending"
     if state == "pending":
         print(f"instance {instance_id} is {_hl('pending')}; waiting for {_hl('running')} ...")
-        run_aws(["ec2", "wait", "instance-running", *region_args, "--instance-ids", instance_id])
+        _aws_call(lambda: _ec2(region).get_waiter("instance_running").wait(InstanceIds=[instance_id]))
         state = "running"
     if state == "running":
         return
@@ -124,21 +187,9 @@ def ensure_running(instance: dict, region: str | None = None) -> None:
 def wait_for_public_ip(instance_id: str, region: str | None = None) -> str:
     deadline = time.monotonic() + IP_POLL_SECONDS
     while True:
-        result = run_aws(
-            [
-                "ec2",
-                "describe-instances",
-                *_region_args(region),
-                "--instance-ids",
-                instance_id,
-                "--query",
-                "Reservations[0].Instances[0].PublicIpAddress",
-                "--output",
-                "text",
-            ]
-        )
-        ip = result.stdout.strip()
-        if ip and ip != "None":
+        resp = _aws_call(lambda: _ec2(region).describe_instances(InstanceIds=[instance_id]))
+        ip = resp["Reservations"][0]["Instances"][0].get("PublicIpAddress")
+        if ip:
             return ip
         if time.monotonic() >= deadline:
             raise CloudvmError(f"instance {instance_id} is running but no public IP after {IP_POLL_SECONDS}s")
@@ -353,7 +404,6 @@ def validate_ssh(alias: str) -> None:
 
 
 def cmd_up(args: argparse.Namespace) -> int:
-    ensure_sso()
     instance = describe_instance(args.name, args.region)
     ensure_running(instance, args.region)
     ip = wait_for_public_ip(instance["InstanceId"], args.region)
@@ -366,7 +416,6 @@ def cmd_up(args: argparse.Namespace) -> int:
 
 
 def cmd_down(args: argparse.Namespace) -> int:
-    ensure_sso()
     instance = describe_instance(args.name, args.region)
     instance_id = instance["InstanceId"]
     state = instance["State"]["Name"]
@@ -377,7 +426,7 @@ def cmd_down(args: argparse.Namespace) -> int:
         print(f"{args.name} ({instance_id}) is already {_hl('stopping')}")
         return 0
     if state in ("running", "pending"):
-        run_aws(["ec2", "stop-instances", *_region_args(args.region), "--instance-ids", instance_id])
+        _aws_call(lambda: _ec2(args.region).stop_instances(InstanceIds=[instance_id]))
         print(f"{args.name} ({instance_id}) is {_hl('stopping')}")
         return 0
     raise CloudvmError(f"instance {instance_id} is in unexpected state {state!r}")
@@ -405,51 +454,17 @@ def match_globs(values: list[str], patterns: list[str]) -> list[str]:
 
 
 def list_aws_regions() -> list[str]:
-    # `describe-regions` is itself a regional API and needs --region. Prefer the user's
-    # configured region (likely nearest/cheapest); fall back to us-east-1 when none is set.
-    region = _configured_region() or "us-east-1"
-    result = run_aws(
-        [
-            "ec2",
-            "describe-regions",
-            "--region",
-            region,
-            "--query",
-            "Regions[].RegionName",
-            "--output",
-            "json",
-        ]
-    )
-    return sorted(json.loads(result.stdout))
-
-
-# AWS region names: e.g. us-east-1, eu-central-1, ap-northeast-2, us-gov-east-1, cn-north-1.
-_REGION_NAME_RE = re.compile(r"^[a-z]{2,}(?:-[a-z]+)+-\d+$")
+    # `describe-regions` is itself a regional API and needs a region for endpoint resolution.
+    # Prefer the session's configured region; us-east-1 is a safe fallback since the response
+    # is global metadata.
+    region = _get_session().region_name or "us-east-1"
+    resp = _aws_call(lambda: _ec2(region).describe_regions())
+    return sorted(r["RegionName"] for r in resp["Regions"])
 
 
 def _configured_region() -> str | None:
-    """Return the region AWS CLI has resolved for the current env/profile, or None if unset.
-
-    Parses `aws configure list` because, unlike `aws configure get region`, it reflects env
-    vars (AWS_REGION, AWS_DEFAULT_REGION) in addition to the config file. Fails loudly if
-    the output format changes (column separator or value shape), rather than silently
-    misreading it.
-    """
-    # TODO should we switch to boto3 and make it sane?
-    result = run_aws(["configure", "list"])
-    for line in result.stdout.splitlines():
-        name, sep, rest = line.partition(":")
-        if name.strip() != "region":
-            continue
-        if not sep:
-            raise CloudvmError(f"unexpected `aws configure list` row (no ':' separator): {line!r}")
-        value = rest.partition(":")[0].strip()
-        if value == "<not set>":
-            return None
-        if not _REGION_NAME_RE.match(value):
-            raise CloudvmError(f"unexpected region value from `aws configure list`: {value!r}")
-        return value
-    raise CloudvmError("could not find 'region' row in `aws configure list` output")
+    """Return the region boto3 resolved for the current env/profile, or None if unset."""
+    return _get_session().region_name
 
 
 def _effective_region() -> str:
@@ -489,22 +504,16 @@ def format_table(
 
 
 def _list_in_region(name_pattern: str, region: str) -> list[list[str]]:
-    result = run_aws(
-        [
-            "ec2",
-            "describe-instances",
-            "--region",
-            region,
-            "--filters",
-            f"Name=tag:Name,Values={name_pattern}",
-            "Name=instance-state-name,Values=pending,running,stopping,stopped",
-            "--output",
-            "json",
-        ]
+    resp = _aws_call(
+        lambda: _ec2(region).describe_instances(
+            Filters=[
+                {"Name": "tag:Name", "Values": [name_pattern]},
+                {"Name": "instance-state-name", "Values": ["pending", "running", "stopping", "stopped"]},
+            ],
+        )
     )
-    data = json.loads(result.stdout)
     rows: list[list[str]] = []
-    for r in data.get("Reservations", []):
+    for r in resp.get("Reservations", []):
         for inst in r.get("Instances", []):
             name = next((t["Value"] for t in inst.get("Tags", []) if t["Key"] == "Name"), "")
             state = inst["State"]["Name"]
@@ -514,7 +523,6 @@ def _list_in_region(name_pattern: str, region: str) -> list[list[str]]:
 
 
 def cmd_list(args: argparse.Namespace) -> int:
-    ensure_sso()
     name_pattern = args.name  # AWS filter natively supports * and ? wildcards
     rows: list[list[str]] = []
 
