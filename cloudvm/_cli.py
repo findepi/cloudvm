@@ -40,11 +40,15 @@ _clients: dict[str | None, Any] = {}
 
 
 def _get_session() -> Any:
+    """Sole entry point for building the AWS SDK session."""
     global _session
     if _session is None:
         import boto3
 
-        _session = boto3.Session()
+        # boto does not respect AWS_REGION while other AWS SDKs do (https://github.com/boto/boto3/issues/3620)
+        # work around this boto limitation to keep it an implementation detail
+        region_name = os.environ.get("AWS_REGION") or None
+        _session = boto3.Session(region_name=region_name)
     return _session
 
 

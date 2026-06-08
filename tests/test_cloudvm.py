@@ -2,6 +2,7 @@
 """Unit tests for cloudvm. Run with: python3 -m unittest discover tests"""
 
 import argparse
+import os
 import sys
 import tempfile
 import unittest
@@ -361,6 +362,44 @@ class VersionStringTests(unittest.TestCase):
         with patch.object(_build_info, "COMMIT", "abc123def"), patch.object(_build_info, "DATE", "2026-06-03"):
             with patch.object(cb, "_installed_version", return_value="1.2.3"):
                 self.assertEqual(cb._version_string(), "cloudvm 1.2.3 (abc123def 2026-06-03)")
+
+
+class AwsEnvContractTests(unittest.TestCase):
+    """cloudvm's env-var handling must match aws-cli v2 semantics, regardless of
+    which AWS SDK is under the hood. These tests guard the contract — if you
+    change `_get_session`, they catch behavior drift."""
+
+    REGION_ENV = ("AWS_REGION", "AWS_DEFAULT_REGION", "AWS_PROFILE", "AWS_DEFAULT_PROFILE")
+
+    def setUp(self):
+        cb._reset_session()
+        self.env_patch = patch.dict(os.environ)
+        self.env_patch.start()
+        for k in self.REGION_ENV:
+            os.environ.pop(k, None)
+        # Isolate from the developer's ~/.aws so the SDK can't pick up local config.
+        os.environ["AWS_CONFIG_FILE"] = "/dev/null"
+        os.environ["AWS_SHARED_CREDENTIALS_FILE"] = "/dev/null"
+
+    def tearDown(self):
+        self.env_patch.stop()
+        cb._reset_session()
+
+    def test_aws_region_is_honored(self):
+        os.environ["AWS_REGION"] = "eu-central-1"
+        self.assertEqual(cb._get_session().region_name, "eu-central-1")
+
+    def test_aws_default_region_is_honored(self):
+        os.environ["AWS_DEFAULT_REGION"] = "us-west-2"
+        self.assertEqual(cb._get_session().region_name, "us-west-2")
+
+    def test_aws_region_wins_over_aws_default_region(self):
+        os.environ["AWS_REGION"] = "eu-central-1"
+        os.environ["AWS_DEFAULT_REGION"] = "us-west-2"
+        self.assertEqual(cb._get_session().region_name, "eu-central-1")
+
+    def test_no_region_env_yields_no_region(self):
+        self.assertIsNone(cb._get_session().region_name)
 
 
 class CompleteRegionTests(unittest.TestCase):
