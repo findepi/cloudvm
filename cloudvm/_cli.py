@@ -536,15 +536,15 @@ def format_table(
     )
 
 
-def _find_instances_in_region(name_pattern: str, region: str) -> list[dict]:
-    """Return instances matching the Name-tag pattern. Each dict has:
+def _find_instances_in_region(name_patterns: list[str], region: str) -> list[dict]:
+    """Return instances matching any of the Name-tag patterns. Each dict has:
     region, instance_id, name, state, public_ip (defaulting to "-").
     Terminated and shutting-down instances are excluded.
     """
     resp = _aws_call(
         lambda: _ec2(region).describe_instances(
             Filters=[
-                {"Name": "tag:Name", "Values": [name_pattern]},
+                {"Name": "tag:Name", "Values": name_patterns},
                 {"Name": "instance-state-name", "Values": ["pending", "running", "stopping", "stopped"]},
             ],
         )
@@ -565,9 +565,9 @@ def _find_instances_in_region(name_pattern: str, region: str) -> list[dict]:
     return instances
 
 
-def _list_in_region(name_pattern: str, region: str) -> list[list[str]]:
+def _list_in_region(name_patterns: list[str], region: str) -> list[list[str]]:
     return [
-        [i["region"], i["name"], i["state"], i["public_ip"]] for i in _find_instances_in_region(name_pattern, region)
+        [i["region"], i["name"], i["state"], i["public_ip"]] for i in _find_instances_in_region(name_patterns, region)
     ]
 
 
@@ -576,7 +576,7 @@ def cmd_delete(args: argparse.Namespace) -> int:
 
     with ThreadPoolExecutor(max_workers=len(regions)) as ex:
         instances = [
-            inst for chunk in ex.map(lambda r: _find_instances_in_region(args.name, r), regions) for inst in chunk
+            inst for chunk in ex.map(lambda r: _find_instances_in_region([args.name], r), regions) for inst in chunk
         ]
 
     if not instances:
@@ -616,11 +616,12 @@ def cmd_delete(args: argparse.Namespace) -> int:
 
 
 def cmd_list(args: argparse.Namespace) -> int:
-    name_pattern = args.name  # AWS filter natively supports * and ? wildcards
+    # AWS filter natively supports * and ? wildcards, and ORs multiple Values.
+    name_patterns = _split_csv(args.name) if args.name else ["*"]
     regions = _resolve_regions(args.region)
 
     with ThreadPoolExecutor(max_workers=len(regions)) as ex:
-        rows = [row for chunk in ex.map(lambda r: _list_in_region(name_pattern, r), regions) for row in chunk]
+        rows = [row for chunk in ex.map(lambda r: _list_in_region(name_patterns, r), regions) for row in chunk]
 
     if not rows:
         print("(no instances match)")
@@ -664,7 +665,7 @@ def _complete_instance_name(prefix, parsed_args=None, **kwargs):
         region = getattr(parsed_args, "region", None) or _configured_region()
         if not region:
             return []
-        rows = _list_in_region("*", region)
+        rows = _list_in_region(["*"], region)
         return sorted({row[1] for row in rows if row[1]})
     except Exception:
         return []
@@ -732,7 +733,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="region glob(s); repeatable and/or comma-separated (e.g. 'eu-central-*,us-*'). "
         "Defaults to AWS_REGION / AWS_DEFAULT_REGION.",
     ).completer = _complete_region
-    lst.add_argument("--name", "-n", default="*", help="Name-tag glob; AWS-native wildcards '*' and '?' (default: '*')")
+    lst.add_argument(
+        "--name",
+        "-n",
+        action="append",
+        default=None,
+        help="Name-tag glob(s); repeatable and/or comma-separated; AWS-native wildcards '*' and '?' (default: '*')",
+    )
     lst.set_defaults(func=cmd_list)
 
     return parser

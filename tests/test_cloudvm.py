@@ -267,7 +267,7 @@ class ResolveRegionsTests(unittest.TestCase):
 class CmdListTests(unittest.TestCase):
     @staticmethod
     def _args(region):
-        return argparse.Namespace(region=region, name="*")
+        return argparse.Namespace(region=region, name=None)
 
     def test_per_region_calls_are_concurrent(self):
         """ThreadPoolExecutor must actually overlap the calls — verify by holding each call
