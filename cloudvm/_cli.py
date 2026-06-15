@@ -536,7 +536,11 @@ def format_table(
     )
 
 
-def _list_in_region(name_pattern: str, region: str) -> list[list[str]]:
+def _find_instances_in_region(name_pattern: str, region: str) -> list[dict]:
+    """Return instances matching the Name-tag pattern. Each dict has:
+    region, instance_id, name, state, public_ip (defaulting to "-").
+    Terminated and shutting-down instances are excluded.
+    """
     resp = _aws_call(
         lambda: _ec2(region).describe_instances(
             Filters=[
@@ -545,14 +549,70 @@ def _list_in_region(name_pattern: str, region: str) -> list[list[str]]:
             ],
         )
     )
-    rows: list[list[str]] = []
+    instances: list[dict] = []
     for r in resp.get("Reservations", []):
         for inst in r.get("Instances", []):
             name = next((t["Value"] for t in inst.get("Tags", []) if t["Key"] == "Name"), "")
-            state = inst["State"]["Name"]
-            ip = inst.get("PublicIpAddress") or "-"
-            rows.append([region, name, state, ip])
-    return rows
+            instances.append(
+                {
+                    "region": region,
+                    "instance_id": inst["InstanceId"],
+                    "name": name,
+                    "state": inst["State"]["Name"],
+                    "public_ip": inst.get("PublicIpAddress") or "-",
+                }
+            )
+    return instances
+
+
+def _list_in_region(name_pattern: str, region: str) -> list[list[str]]:
+    return [
+        [i["region"], i["name"], i["state"], i["public_ip"]] for i in _find_instances_in_region(name_pattern, region)
+    ]
+
+
+def cmd_delete(args: argparse.Namespace) -> int:
+    regions = _resolve_regions(args.region)
+
+    with ThreadPoolExecutor(max_workers=len(regions)) as ex:
+        instances = [
+            inst for chunk in ex.map(lambda r: _find_instances_in_region(args.name, r), regions) for inst in chunk
+        ]
+
+    if not instances:
+        print("(no instances match)")
+        return 0
+
+    instances.sort(key=lambda i: (i["region"], i["name"]))
+    rows = [[i["region"], i["name"], i["instance_id"], i["state"], i["public_ip"]] for i in instances]
+    print(
+        format_table(
+            ["region", "name", "instance id", "status", "public IP"],
+            rows,
+            col_wrappers=[None, None, None, _hl, None],
+        )
+    )
+
+    if not args.force:
+        try:
+            answer = input(f"\nDelete {len(instances)} instance(s)? [y/N] ").strip().lower()
+        except EOFError:
+            answer = ""
+        if answer not in ("y", "yes"):
+            print("aborted")
+            return 1
+
+    by_region: dict[str, list[dict]] = {}
+    for inst in instances:
+        by_region.setdefault(inst["region"], []).append(inst)
+
+    for region, region_instances in by_region.items():
+        ids = [i["instance_id"] for i in region_instances]
+        _aws_call(lambda: _ec2(region).terminate_instances(InstanceIds=ids))
+        for inst in region_instances:
+            print(f"{inst['name']} ({inst['instance_id']}) is {_hl('shutting-down')}")
+
+    return 0
 
 
 def cmd_list(args: argparse.Namespace) -> int:
@@ -648,6 +708,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--region", "-r", default=None, help="AWS region; omit to let aws-cli use its own default"
     ).completer = _complete_region
     down.set_defaults(func=cmd_down)
+
+    delete = sub.add_parser("delete", help="terminate matching instance(s); asks for confirmation unless --force")
+    delete.add_argument(
+        "--name", "-n", required=True, help="EC2 Name-tag glob; AWS-native wildcards '*' and '?'"
+    ).completer = _complete_instance_name
+    delete.add_argument(
+        "--region",
+        "-r",
+        action="append",
+        default=None,
+        help="region glob(s); repeatable and/or comma-separated. Defaults to AWS_REGION / AWS_DEFAULT_REGION.",
+    ).completer = _complete_region
+    delete.add_argument("-f", "--force", action="store_true", help="skip the confirmation prompt")
+    delete.set_defaults(func=cmd_delete)
 
     lst = sub.add_parser("list", help="list instances across regions matching name and region globs")
     lst.add_argument(
