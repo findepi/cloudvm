@@ -205,6 +205,7 @@ def wait_for_public_ip(instance_id: str, region: str | None = None) -> str:
 
 HOST_LINE_RE = re.compile(r"^(\s*)(Host)(\s+)(.+?)\s*$", re.IGNORECASE)
 HOSTNAME_LINE_RE = re.compile(r"^(\s*)(HostName|Hostname)(\s+)(\S+)(.*)$", re.IGNORECASE)
+COMMENTED_HOSTNAME_LINE_RE = re.compile(r"^(\s*)#\s*(HostName|Hostname)(\s+)(\S+)(.*)$", re.IGNORECASE)
 
 
 def _host_tokens(line: str) -> list[str] | None:
@@ -232,9 +233,13 @@ def find_host_block(lines: list[str], alias: str) -> tuple[int, int] | None:
 
 
 def replace_hostname_in_block(lines: list[str], start: int, end: int, ip: str) -> bool:
-    """Replace the `Hostname` value inside lines[start:end]. Return True if a line was changed."""
+    """Replace the `Hostname` value inside lines[start:end]. Return True if a line was changed.
+
+    A commented-out `# Hostname X` line — as left by `down --update-ssh` — is uncommented
+    and the IP updated in one step, so `up` after `down` round-trips cleanly.
+    """
     for i in range(start + 1, end):
-        m = HOSTNAME_LINE_RE.match(lines[i])
+        m = HOSTNAME_LINE_RE.match(lines[i]) or COMMENTED_HOSTNAME_LINE_RE.match(lines[i])
         if m:
             new_line = f"{m.group(1)}{m.group(2)}{m.group(3)}{ip}{m.group(5)}"
             if not new_line.endswith("\n") and lines[i].endswith("\n"):
@@ -253,6 +258,19 @@ def replace_hostname_in_block(lines: list[str], start: int, end: int, ip: str) -
     insert_at = start + 1
     lines.insert(insert_at, f"{indent}Hostname {ip}\n")
     return True
+
+
+def comment_out_hostname_in_block(lines: list[str], start: int, end: int) -> bool:
+    """Prefix the active `Hostname` line in lines[start:end] with `# `. Return True if a line
+    was changed; False if there is no active Hostname (already commented, or missing)."""
+    for i in range(start + 1, end):
+        m = HOSTNAME_LINE_RE.match(lines[i])
+        if m:
+            indent = m.group(1)
+            rest = lines[i][len(indent) :]
+            lines[i] = f"{indent}# {rest}"
+            return True
+    return False
 
 
 def _similar_block_defaults(lines: list[str], alias: str) -> dict[str, str]:
@@ -331,6 +349,40 @@ def prompt_new_block(alias: str, ip: str, lines: list[str]) -> str | None:
     return block_text
 
 
+def _commit_ssh_config(new_text: str, alias: str, expected_hostname: str | None) -> None:
+    """Validate `new_text` via `ssh -G`, back up the existing config, then atomically replace it.
+
+    If `expected_hostname` is given, additionally assert that `ssh -G` resolves to it.
+    Pass None to skip that check (e.g., when commenting out a Hostname — ssh then falls back
+    to the alias literal and the expected resolution depends on the surrounding config).
+    """
+    tmp = SSH_CONFIG.with_suffix(SSH_CONFIG.suffix + f".tmp.{os.getpid()}")
+    tmp.write_text(new_text)
+    try:
+        validate = subprocess.run(
+            ["ssh", "-G", alias, "-F", str(tmp)],
+            capture_output=True,
+            text=True,
+        )
+        if validate.returncode != 0:
+            raise CloudvmError(f"ssh rejected the new config: {validate.stderr.strip()}")
+        if expected_hostname is not None:
+            resolved = None
+            for line in validate.stdout.splitlines():
+                if line.startswith("hostname "):
+                    resolved = line.split(" ", 1)[1].strip()
+                    break
+            if resolved != expected_hostname:
+                raise CloudvmError(
+                    f"validation: ssh -G resolved hostname to {resolved!r}, expected {expected_hostname!r}"
+                )
+        shutil.copyfile(SSH_CONFIG, SSH_CONFIG_BACKUP)
+        os.replace(tmp, SSH_CONFIG)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
 def update_ssh_config(alias: str, ip: str) -> None:
     if not SSH_CONFIG.exists():
         raise CloudvmError(f"{SSH_CONFIG} does not exist; refusing to create it")
@@ -355,30 +407,29 @@ def update_ssh_config(alias: str, ip: str) -> None:
             return
         new_text = "".join(lines)
 
-    tmp = SSH_CONFIG.with_suffix(SSH_CONFIG.suffix + f".tmp.{os.getpid()}")
-    tmp.write_text(new_text)
-    try:
-        validate = subprocess.run(
-            ["ssh", "-G", alias, "-F", str(tmp)],
-            capture_output=True,
-            text=True,
-        )
-        if validate.returncode != 0:
-            raise CloudvmError(f"ssh rejected the new config: {validate.stderr.strip()}")
-        resolved = None
-        for line in validate.stdout.splitlines():
-            if line.startswith("hostname "):
-                resolved = line.split(" ", 1)[1].strip()
-                break
-        if resolved != ip:
-            raise CloudvmError(f"validation: ssh -G resolved hostname to {resolved!r}, expected {ip!r}")
-        shutil.copyfile(SSH_CONFIG, SSH_CONFIG_BACKUP)
-        os.replace(tmp, SSH_CONFIG)
-    finally:
-        if tmp.exists():
-            tmp.unlink()
-
+    _commit_ssh_config(new_text, alias, expected_hostname=ip)
     print(f"Updated {SSH_CONFIG}: Host {alias} -> {ip} (backup at {SSH_CONFIG_BACKUP})")
+
+
+def disable_ssh_config(alias: str) -> None:
+    """Comment out the matching Host block's Hostname so `ssh <alias>` no longer connects to a stale IP.
+
+    No-op when the block doesn't exist or the Hostname is already commented/absent.
+    """
+    if not SSH_CONFIG.exists():
+        raise CloudvmError(f"{SSH_CONFIG} does not exist; refusing to create it")
+
+    lines = SSH_CONFIG.read_text().splitlines(keepends=True)
+    block = find_host_block(lines, alias)
+    if block is None:
+        print(f"No `Host {alias}` block in {SSH_CONFIG}; skipped ssh_config update.")
+        return
+    start, end = block
+    if not comment_out_hostname_in_block(lines, start, end):
+        print(f"{SSH_CONFIG}: Hostname for `{alias}` is already disabled; nothing to do.")
+        return
+    _commit_ssh_config("".join(lines), alias, expected_hostname=None)
+    print(f"Updated {SSH_CONFIG}: Host {alias} Hostname disabled (backup at {SSH_CONFIG_BACKUP})")
 
 
 def validate_ssh(alias: str) -> None:
@@ -426,15 +477,16 @@ def cmd_down(args: argparse.Namespace) -> int:
     state = instance["State"]["Name"]
     if state == "stopped":
         print(f"{args.name} ({instance_id}) is already {_hl('stopped')}")
-        return 0
-    if state == "stopping":
+    elif state == "stopping":
         print(f"{args.name} ({instance_id}) is already {_hl('stopping')}")
-        return 0
-    if state in ("running", "pending"):
+    elif state in ("running", "pending"):
         _aws_call(lambda: _ec2(args.region).stop_instances(InstanceIds=[instance_id]))
         print(f"{args.name} ({instance_id}) is {_hl('stopping')}")
-        return 0
-    raise CloudvmError(f"instance {instance_id} is in unexpected state {state!r}")
+    else:
+        raise CloudvmError(f"instance {instance_id} is in unexpected state {state!r}")
+    if args.update_ssh:
+        disable_ssh_config(args.ssh_alias or args.name)
+    return 0
 
 
 def _split_csv(values: list[str]) -> list[str]:
@@ -708,6 +760,12 @@ def build_parser() -> argparse.ArgumentParser:
     down.add_argument(
         "--region", "-r", default=None, help="AWS region; omit to let aws-cli use its own default"
     ).completer = _complete_region
+    down.add_argument(
+        "--update-ssh",
+        action="store_true",
+        help="comment out the matching Host block's Hostname in ~/.ssh/config",
+    )
+    down.add_argument("--ssh-alias", help="ssh_config Host alias to update (defaults to --name)")
     down.set_defaults(func=cmd_down)
 
     delete = sub.add_parser("delete", help="terminate matching instance(s); asks for confirmation unless --force")

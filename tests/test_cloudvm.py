@@ -3,6 +3,7 @@
 
 import argparse
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -164,6 +165,94 @@ class SshConfigEditTests(unittest.TestCase):
         defaults = cb._similar_block_defaults(self._lines(), "completely-unrelated-name")
         self.assertEqual(defaults, {})
 
+    # --- comment_out_hostname_in_block ---
+
+    def test_comment_out_prefixes_hash(self):
+        lines = self._lines()
+        block = cb.find_host_block(lines, "my-dev-box-3")
+        self.assertIsNotNone(block)
+        start, end = block
+        self.assertTrue(cb.comment_out_hostname_in_block(lines, start, end))
+        # The line that was `    Hostname 2.2.2.2\n` is now `    # Hostname 2.2.2.2\n`
+        self.assertTrue(any(ln == "    # Hostname 2.2.2.2\n" for ln in lines))
+        # Other blocks' Hostnames must not be touched
+        self.assertTrue(any(ln == "    Hostname 1.1.1.1\n" for ln in lines))
+        self.assertTrue(any(ln == "    Hostname 3.3.3.3\n" for ln in lines))
+
+    def test_comment_out_is_noop_when_already_commented(self):
+        config = "Host alpha\n    # Hostname 1.2.3.4\n"
+        lines = config.splitlines(keepends=True)
+        block = cb.find_host_block(lines, "alpha")
+        self.assertIsNotNone(block)
+        start, end = block
+        self.assertFalse(cb.comment_out_hostname_in_block(lines, start, end))
+        self.assertEqual("".join(lines), config)
+
+    def test_comment_out_is_noop_when_no_hostname(self):
+        config = "Host alpha\n    User someone\n"
+        lines = config.splitlines(keepends=True)
+        block = cb.find_host_block(lines, "alpha")
+        self.assertIsNotNone(block)
+        start, end = block
+        self.assertFalse(cb.comment_out_hostname_in_block(lines, start, end))
+        self.assertEqual("".join(lines), config)
+
+    # --- disable_ssh_config (in-place edit) ---
+
+    def test_disable_comments_out_hostname(self):
+        cb.disable_ssh_config("my-dev-box-3")
+        text = self.path.read_text()
+        self.assertIn("    # Hostname 2.2.2.2\n", text)
+        # Other blocks' Hostnames unchanged
+        self.assertIn("    Hostname 1.1.1.1\n", text)
+        self.assertIn("    Hostname 3.3.3.3\n", text)
+        # ssh -G must accept the resulting config
+        result = subprocess.run(
+            ["ssh", "-G", "my-dev-box-3", "-F", str(self.path)],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0)
+
+    def test_disable_preserves_neighboring_comment(self):
+        cb.disable_ssh_config("my-dev-box-3")
+        text = self.path.read_text()
+        # `# current IP` comment must still sit immediately above the (now commented) Hostname
+        self.assertIn("    # current IP\n    # Hostname 2.2.2.2\n", text)
+
+    def test_disable_idempotent_when_already_disabled(self):
+        cb.disable_ssh_config("my-dev-box-3")
+        # Drop the backup so we can prove the second call did not write again
+        cb.SSH_CONFIG_BACKUP.unlink()
+        cb.disable_ssh_config("my-dev-box-3")
+        self.assertFalse(cb.SSH_CONFIG_BACKUP.exists())
+
+    def test_disable_no_block_does_not_touch_file_or_create_backup(self):
+        original = self.path.read_text()
+        cb.disable_ssh_config("nonexistent-alias")
+        self.assertEqual(self.path.read_text(), original)
+        self.assertFalse(cb.SSH_CONFIG_BACKUP.exists())
+
+    def test_up_after_down_round_trips(self):
+        # down comments out, up uncomments and sets the new IP in place — single Hostname line.
+        cb.disable_ssh_config("my-dev-box-3")
+        cb.update_ssh_config("my-dev-box-3", "9.9.9.9")
+        text = self.path.read_text()
+        self.assertIn("    Hostname 9.9.9.9\n", text)
+        # The old commented-out line must be gone (it was uncommented + updated, not duplicated)
+        self.assertNotIn("# Hostname 2.2.2.2", text)
+        self.assertNotIn("Hostname 2.2.2.2", text)
+
+    def test_replace_hostname_recognizes_commented_line(self):
+        # replace_hostname_in_block should uncomment-and-update a `# Hostname X` line in place,
+        # not inject a second Hostname directive.
+        config = "Host alpha\n    # Hostname 1.2.3.4\n    User someone\n"
+        self.path.write_text(config)
+        cb.update_ssh_config("alpha", "5.6.7.8")
+        text = self.path.read_text()
+        self.assertIn("    Hostname 5.6.7.8\n", text)
+        self.assertEqual(text.count("Hostname"), 1)
+
 
 class RegionGlobTests(unittest.TestCase):
     def test_split_csv_flattens(self):
@@ -284,6 +373,67 @@ class CmdListTests(unittest.TestCase):
         with patch.object(cb, "_list_in_region", side_effect=slow):
             rc = cb.cmd_list(self._args([",".join(regions_in)]))
         self.assertEqual(rc, 0)
+
+
+class CmdDownTests(unittest.TestCase):
+    @staticmethod
+    def _args(state, *, update_ssh=False, ssh_alias=None, name="my-dev-box"):
+        return argparse.Namespace(
+            name=name,
+            region=None,
+            update_ssh=update_ssh,
+            ssh_alias=ssh_alias,
+            _state=state,
+        )
+
+    def _patch_describe(self, state):
+        return patch.object(
+            cb,
+            "describe_instance",
+            return_value={"InstanceId": "i-abc123", "State": {"Name": state}},
+        )
+
+    def test_update_ssh_disables_when_running(self):
+        # `down --update-ssh` stops the instance and disables its ssh_config block.
+        with (
+            self._patch_describe("running"),
+            patch.object(cb, "_aws_call") as aws_call,
+            patch.object(cb, "disable_ssh_config") as disable,
+        ):
+            rc = cb.cmd_down(self._args("running", update_ssh=True))
+        self.assertEqual(rc, 0)
+        aws_call.assert_called_once()
+        disable.assert_called_once_with("my-dev-box")
+
+    def test_update_ssh_disables_when_already_stopped(self):
+        # The ssh edit is independent of instance state — stale IP needs clearing either way.
+        with (
+            self._patch_describe("stopped"),
+            patch.object(cb, "_aws_call") as aws_call,
+            patch.object(cb, "disable_ssh_config") as disable,
+        ):
+            rc = cb.cmd_down(self._args("stopped", update_ssh=True))
+        self.assertEqual(rc, 0)
+        aws_call.assert_not_called()
+        disable.assert_called_once_with("my-dev-box")
+
+    def test_update_ssh_honors_ssh_alias_override(self):
+        with (
+            self._patch_describe("stopped"),
+            patch.object(cb, "_aws_call"),
+            patch.object(cb, "disable_ssh_config") as disable,
+        ):
+            cb.cmd_down(self._args("stopped", update_ssh=True, ssh_alias="my-alias"))
+        disable.assert_called_once_with("my-alias")
+
+    def test_without_update_ssh_does_not_touch_config(self):
+        with (
+            self._patch_describe("running"),
+            patch.object(cb, "_aws_call"),
+            patch.object(cb, "disable_ssh_config") as disable,
+        ):
+            cb.cmd_down(self._args("running", update_ssh=False))
+        disable.assert_not_called()
 
 
 class FormatTableTests(unittest.TestCase):
