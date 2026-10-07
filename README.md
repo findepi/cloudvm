@@ -41,6 +41,11 @@ usual AWS environment variables (`AWS_REGION`, `AWS_PROFILE`, ...).
 Pass `--update-ssh` to `up` to point the matching `~/.ssh/config` host
 alias at the new IP.
 
+When EC2 has no capacity for the instance type (`InsufficientInstanceCapacity`),
+pass `--retry DURATION` (e.g. `30m`, `2h`, `1h30m`) or `--retry forever` to
+`up` to keep trying with backoff. If the start succeeds only after retrying,
+`up` rings the terminal bell and, on macOS, posts a notification.
+
 ## Shell completion
 
 To enable tab-completion, add this to your `~/.bashrc` (or `~/.zshrc`,

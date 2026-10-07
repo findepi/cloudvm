@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import math
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -28,6 +30,12 @@ SSH_CONFIG_BACKUP = Path.home() / ".ssh" / "config.bak"
 # How long to wait for a public IP after the instance reports running.
 IP_POLL_SECONDS = 60
 IP_POLL_INTERVAL = 1.0
+
+# Backoff between start attempts while EC2 reports InsufficientInstanceCapacity (`up --retry`).
+CAPACITY_RETRY_INITIAL = 5.0
+CAPACITY_RETRY_MAX = 60.0
+CAPACITY_RETRY_FACTOR = 1.5
+CAPACITY_RETRY_JITTER = 0.2
 
 
 class CloudvmError(Exception):
@@ -162,15 +170,18 @@ def describe_instance(name: str, region: str | None = None) -> dict:
     return instances[0]
 
 
-def ensure_running(instance: dict, region: str | None = None) -> None:
+def ensure_running(instance: dict, region: str | None = None, retry_seconds: float = 0.0) -> bool:
     """Walk the instance from its current state to `running`, transition by transition.
 
     Each branch handles one state and its own wait, then advances `state` to the next
     state in the progression: stopping -> stopped -> pending -> running.
     start_instances would otherwise refuse a stopping instance with IncorrectInstanceState.
+
+    Returns True if starting had to be retried because EC2 lacked capacity.
     """
     instance_id = instance["InstanceId"]
     state = instance["State"]["Name"]
+    retried = False
 
     if state == "stopping":
         print(f"instance {instance_id} is {_hl('stopping')}; waiting for {_hl('stopped')} ...")
@@ -178,15 +189,111 @@ def ensure_running(instance: dict, region: str | None = None) -> None:
         state = "stopped"
     if state == "stopped":
         print(f"instance {instance_id} is {_hl('stopped')}; starting ...")
-        _aws_call(lambda: _ec2(region).start_instances(InstanceIds=[instance_id]))
+        retried = start_with_capacity_retry(instance, region, retry_seconds)
         state = "pending"
     if state == "pending":
         print(f"instance {instance_id} is {_hl('pending')}; waiting for {_hl('running')} ...")
         _aws_call(lambda: _ec2(region).get_waiter("instance_running").wait(InstanceIds=[instance_id]))
         state = "running"
     if state == "running":
-        return
+        return retried
     raise CloudvmError(f"instance {instance_id} is in unexpected state {state!r}")
+
+
+def _is_insufficient_capacity(exc: BaseException) -> bool:
+    import botocore.exceptions as bex
+
+    # `_aws_call` wraps botocore errors as CloudvmError; the original is kept as `__cause__`.
+    cause = exc.__cause__
+    return isinstance(cause, bex.ClientError) and cause.response.get("Error", {}).get("Code") == (
+        "InsufficientInstanceCapacity"
+    )
+
+
+def start_with_capacity_retry(instance: dict, region: str | None, retry_seconds: float) -> bool:
+    """Start a stopped instance, retrying on InsufficientInstanceCapacity for up to `retry_seconds`.
+
+    Other errors fail immediately. botocore's own retries stay in effect for each attempt,
+    so the deadline may be overshot by the duration of one attempt.
+    Returns True if at least one attempt failed for lack of capacity.
+    """
+    instance_id = instance["InstanceId"]
+    where = f"{instance.get('InstanceType', '?')} in {instance.get('Placement', {}).get('AvailabilityZone', '?')}"
+    start = time.monotonic()
+    deadline = start + retry_seconds
+    delay = CAPACITY_RETRY_INITIAL
+    attempt = 1
+    while True:
+        try:
+            _aws_call(lambda: _ec2(region).start_instances(InstanceIds=[instance_id]))
+            return attempt > 1
+        except CloudvmError as exc:
+            if not _is_insufficient_capacity(exc):
+                raise
+            now = time.monotonic()
+            if now >= deadline:
+                if retry_seconds <= 0:
+                    raise CloudvmError(f"{exc} (pass --retry DURATION|forever to keep trying)") from exc
+                waited = format_duration(now - start)
+                name = next((t["Value"] for t in instance.get("Tags", []) if t["Key"] == "Name"), instance_id)
+                notify(f"Giving up on {name} ☹️ AWS had no {where} for {waited}")
+                raise CloudvmError(f"still no capacity for {where} after {attempt} attempts ({waited})") from exc
+            jittered = delay * random.uniform(1 - CAPACITY_RETRY_JITTER, 1 + CAPACITY_RETRY_JITTER)
+            sleep_for = min(jittered, CAPACITY_RETRY_MAX, deadline - now)
+            print(
+                f"insufficient capacity for {where}; retrying in {format_duration(sleep_for)} "
+                f"(attempt {attempt}, elapsed {format_duration(now - start)})"
+            )
+            time.sleep(sleep_for)
+            delay = min(delay * CAPACITY_RETRY_FACTOR, CAPACITY_RETRY_MAX)
+            attempt += 1
+
+
+_DURATION_RE = re.compile(r"(\d+)([smhd]?)")
+_DURATION_UNITS = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}
+
+
+def parse_retry_duration(value: str) -> float:
+    """argparse type for `--retry`: `forever`, or a duration like `90`, `30s`, `15m`, `1h30m`, `2d`."""
+    text = value.strip().lower()
+    if text == "forever":
+        return math.inf
+    parts = _DURATION_RE.findall(text)
+    if not text or "".join(n + u for n, u in parts) != text:
+        raise argparse.ArgumentTypeError(f"invalid duration {value!r}; use e.g. 30m, 2h, 1h30m or 'forever'")
+    return float(sum(int(n) * _DURATION_UNITS[u] for n, u in parts))
+
+
+def format_duration(seconds: float) -> str:
+    total = int(round(seconds))
+    hours, rest = divmod(total, 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m"
+    if minutes:
+        return f"{minutes}m{secs:02d}s"
+    return f"{secs}s"
+
+
+def notify(message: str) -> None:
+    """Best-effort attention grab for unattended runs: terminal bell, plus a macOS notification."""
+    if sys.stdout.isatty():
+        sys.stdout.write("\a")
+        sys.stdout.flush()
+    if sys.platform == "darwin" and shutil.which("osascript"):
+        # Pass the message as an argument rather than splicing it into the script, so it can't inject AppleScript.
+        script = [
+            "-e",
+            "on run argv",
+            "-e",
+            'display notification (item 1 of argv) with title "cloudvm"',
+            "-e",
+            "end run",
+        ]
+        try:
+            subprocess.run(["osascript", *script, message], capture_output=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            pass
 
 
 def wait_for_public_ip(instance_id: str, region: str | None = None) -> str:
@@ -461,13 +568,15 @@ def validate_ssh(alias: str) -> None:
 
 def cmd_up(args: argparse.Namespace) -> int:
     instance = describe_instance(args.name, args.region)
-    ensure_running(instance, args.region)
+    retried = ensure_running(instance, args.region, args.retry)
     ip = wait_for_public_ip(instance["InstanceId"], args.region)
     print(f"{args.name} ({instance['InstanceId']}) is {_hl('running')} at {ip}")
     if args.update_ssh:
         alias = args.ssh_alias or args.name
         update_ssh_config(alias, ip)
         validate_ssh(alias)
+    if retried:
+        notify(f"{args.name} is running at {ip}")
     return 0
 
 
@@ -751,6 +860,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--update-ssh", action="store_true", help="update the matching Host block's Hostname in ~/.ssh/config"
     )
     up.add_argument("--ssh-alias", help="ssh_config Host alias to update (defaults to --name)")
+    up.add_argument(
+        "--retry",
+        type=parse_retry_duration,
+        default=0.0,
+        metavar="DURATION",
+        help="keep retrying the start while EC2 reports insufficient capacity, for up to DURATION "
+        "(e.g. 30m, 2h, 1h30m) or 'forever'; notifies when the instance finally starts",
+    )
     up.set_defaults(func=cmd_up)
 
     down = sub.add_parser("down", help="trigger stop on a running instance (does not wait for fully stopped)")

@@ -2,6 +2,7 @@
 """Unit tests for cloudvm. Run with: python3 -m unittest discover tests"""
 
 import argparse
+import math
 import os
 import subprocess
 import sys
@@ -434,6 +435,135 @@ class CmdDownTests(unittest.TestCase):
         ):
             cb.cmd_down(self._args("running", update_ssh=False))
         disable.assert_not_called()
+
+
+def _ice_error():
+    err = botocore.exceptions.ClientError(
+        {"Error": {"Code": "InsufficientInstanceCapacity", "Message": "Insufficient capacity."}}, "StartInstances"
+    )
+    try:
+        cb._raise_as_cloudvm(err)
+    except cb.CloudvmError as exc:
+        return exc
+
+
+def _other_error():
+    err = botocore.exceptions.ClientError(
+        {"Error": {"Code": "UnauthorizedOperation", "Message": "no"}}, "StartInstances"
+    )
+    try:
+        cb._raise_as_cloudvm(err)
+    except cb.CloudvmError as exc:
+        return exc
+
+
+class CapacityRetryTests(unittest.TestCase):
+    INSTANCE = {
+        "InstanceId": "i-abc123",
+        "Tags": [{"Key": "Name", "Value": "my-dev-box"}],
+        "InstanceType": "g6.xlarge",
+        "Placement": {"AvailabilityZone": "eu-central-1a"},
+    }
+
+    def _run(self, side_effect, retry_seconds, clock=None):
+        clock = clock or iter(range(0, 10_000, 30))
+        with (
+            patch.object(cb, "_aws_call", side_effect=side_effect) as aws_call,
+            patch.object(cb.time, "sleep") as sleep,
+            patch.object(cb.time, "monotonic", side_effect=lambda: next(clock)),
+            patch.object(cb, "notify") as self.notify,
+            patch("builtins.print"),
+        ):
+            result = cb.start_with_capacity_retry(self.INSTANCE, None, retry_seconds)
+        return result, aws_call, sleep
+
+    def test_first_try_success_is_not_retried(self):
+        result, aws_call, sleep = self._run([None], 3600)
+        self.assertFalse(result)
+        aws_call.assert_called_once()
+        sleep.assert_not_called()
+
+    def test_retries_until_capacity_appears(self):
+        result, aws_call, sleep = self._run([_ice_error(), _ice_error(), None], 3600)
+        self.assertTrue(result)
+        self.assertEqual(aws_call.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_without_retry_fails_immediately_with_hint(self):
+        with self.assertRaisesRegex(cb.CloudvmError, "--retry"):
+            self._run([_ice_error()], 0.0)
+
+    def test_other_errors_are_not_retried(self):
+        with self.assertRaisesRegex(cb.CloudvmError, "UnauthorizedOperation"):
+            self._run([_ice_error(), _other_error(), None], 3600)
+
+    def test_gives_up_at_deadline(self):
+        # Each monotonic() call advances 30s; a 60s budget allows a couple of attempts, not unlimited.
+        with self.assertRaisesRegex(cb.CloudvmError, "still no capacity for g6.xlarge in eu-central-1a"):
+            self._run([_ice_error()] * 10, 60)
+        self.notify.assert_called_once_with("Giving up on my-dev-box ☹️ AWS had no g6.xlarge in eu-central-1a for 1m00s")
+
+    def test_no_give_up_notification_without_retry(self):
+        with self.assertRaises(cb.CloudvmError):
+            self._run([_ice_error()], 0.0)
+        self.notify.assert_not_called()
+
+    def test_forever_keeps_going(self):
+        result, aws_call, _ = self._run([_ice_error()] * 50 + [None], math.inf)
+        self.assertTrue(result)
+        self.assertEqual(aws_call.call_count, 51)
+
+    def test_sleep_never_exceeds_cap_despite_jitter(self):
+        _, _, sleep = self._run([_ice_error()] * 30 + [None], math.inf)
+        self.assertLessEqual(max(c.args[0] for c in sleep.call_args_list), cb.CAPACITY_RETRY_MAX)
+
+    def test_sleep_never_overshoots_deadline(self):
+        clock = iter([0, 0, 50, 50])
+        _, _, sleep = self._run([_ice_error(), _ice_error(), None], 60, clock=clock)
+        self.assertLessEqual(sleep.call_args_list[1].args[0], 10)
+
+
+class ParseRetryDurationTests(unittest.TestCase):
+    def test_forever(self):
+        self.assertEqual(cb.parse_retry_duration("forever"), math.inf)
+        self.assertEqual(cb.parse_retry_duration("FOREVER"), math.inf)
+
+    def test_units(self):
+        self.assertEqual(cb.parse_retry_duration("90"), 90)
+        self.assertEqual(cb.parse_retry_duration("30s"), 30)
+        self.assertEqual(cb.parse_retry_duration("15m"), 900)
+        self.assertEqual(cb.parse_retry_duration("2h"), 7200)
+        self.assertEqual(cb.parse_retry_duration("1h30m"), 5400)
+        self.assertEqual(cb.parse_retry_duration("1d"), 86400)
+
+    def test_invalid(self):
+        for bad in ("", "abc", "10x", "1.5h", "-5m", "m", "1h 30m"):
+            with self.subTest(bad=bad), self.assertRaises(argparse.ArgumentTypeError):
+                cb.parse_retry_duration(bad)
+
+
+# noinspection PyPep8Naming
+class CmdUpNotifyTests(unittest.TestCase):
+    @staticmethod
+    def _args():
+        return argparse.Namespace(name="my-dev-box", region=None, update_ssh=False, ssh_alias=None, retry=math.inf)
+
+    def _run(self, retried):
+        with (
+            patch.object(cb, "describe_instance", return_value={"InstanceId": "i-abc123"}),
+            patch.object(cb, "ensure_running", return_value=retried),
+            patch.object(cb, "wait_for_public_ip", return_value="1.2.3.4"),
+            patch.object(cb, "notify") as notify,
+            patch("builtins.print"),
+        ):
+            self.assertEqual(cb.cmd_up(self._args()), 0)
+        return notify
+
+    def test_notifies_only_after_retrying(self):
+        self._run(retried=True).assert_called_once_with("my-dev-box is running at 1.2.3.4")
+
+    def test_no_notification_when_started_first_try(self):
+        self._run(retried=False).assert_not_called()
 
 
 class FormatTableTests(unittest.TestCase):
