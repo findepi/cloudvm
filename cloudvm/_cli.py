@@ -807,6 +807,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     argcomplete.autocomplete(parser)
     args = parser.parse_args(argv)
+    # Progress (e.g. instance state transitions) must show up live even when piped to tee or a log file.
+    sys.stdout.reconfigure(line_buffering=True)
     try:
         return args.func(args)
     except CloudvmError as exc:
