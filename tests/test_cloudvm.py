@@ -542,6 +542,18 @@ class ParseRetryDurationTests(unittest.TestCase):
                 cb.parse_retry_duration(bad)
 
 
+class NotificationSequenceTests(unittest.TestCase):
+    def test_osc9_then_bell(self):
+        self.assertEqual(cb.notification_sequence("box is running"), "\x1b]9;box is running\x1b\\\a")
+
+    def test_control_characters_are_dropped(self):
+        # An ESC or BEL in the message must not terminate the OSC early and smuggle in other escapes.
+        self.assertEqual(cb.notification_sequence("a\x1b]0;x\x07b\nc\x9b"), "\x1b]9;a]0;xbc\x1b\\\a")
+
+    def test_keeps_non_ascii(self):
+        self.assertIn("Giving up ☹️", cb.notification_sequence("Giving up ☹️"))
+
+
 # noinspection PyPep8Naming
 class CmdUpNotifyTests(unittest.TestCase):
     @staticmethod

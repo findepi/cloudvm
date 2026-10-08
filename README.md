@@ -44,7 +44,9 @@ alias at the new IP.
 When EC2 has no capacity for the instance type (`InsufficientInstanceCapacity`),
 pass `--retry DURATION` (e.g. `30m`, `2h`, `1h30m`) or `--retry forever` to
 `up` to keep trying with backoff. If the start succeeds only after retrying,
-`up` rings the terminal bell and, on macOS, posts a notification.
+`up` rings the terminal bell and asks the terminal to post a desktop notification
+(OSC 9; supported by e.g. Ghostty, iTerm2 and WezTerm). It does the same when
+it gives up.
 
 ## Shell completion
 

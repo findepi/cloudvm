@@ -275,25 +275,30 @@ def format_duration(seconds: float) -> str:
     return f"{secs}s"
 
 
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def notification_sequence(message: str) -> str:
+    """Terminal escape sequence for a desktop notification (OSC 9) followed by a bell.
+
+    Terminals that support OSC 9 (Ghostty, iTerm2, WezTerm, ...) post it as their own notification,
+    which also works over ssh; others ignore it. Control characters are dropped from `message` so
+    text such as an instance name can't end the sequence early and inject escapes.
+    """
+    text = _CONTROL_CHARS_RE.sub("", message)
+    return f"\x1b]9;{text}\x1b\\\a"
+
+
 def notify(message: str) -> None:
-    """Best-effort attention grab for unattended runs: terminal bell, plus a macOS notification."""
-    if sys.stdout.isatty():
-        sys.stdout.write("\a")
-        sys.stdout.flush()
-    if sys.platform == "darwin" and shutil.which("osascript"):
-        # Pass the message as an argument rather than splicing it into the script, so it can't inject AppleScript.
-        script = [
-            "-e",
-            "on run argv",
-            "-e",
-            'display notification (item 1 of argv) with title "cloudvm"',
-            "-e",
-            "end run",
-        ]
-        try:
-            subprocess.run(["osascript", *script, message], capture_output=True, timeout=10)
-        except (OSError, subprocess.SubprocessError):
-            pass
+    """Best-effort attention grab for unattended runs: desktop notification via the terminal, plus a bell.
+
+    Written to /dev/tty rather than stdout so it still reaches the terminal when output is piped.
+    """
+    try:
+        with open("/dev/tty", "w") as tty:
+            tty.write(notification_sequence(message))
+    except OSError:
+        pass
 
 
 def wait_for_public_ip(instance_id: str, region: str | None = None) -> str:
