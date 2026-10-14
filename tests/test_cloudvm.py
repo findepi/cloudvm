@@ -102,6 +102,13 @@ class SshConfigEditTests(unittest.TestCase):
         # And exact-only: glob characters don't match
         self.assertIsNone(cb.find_host_block(lines, "alph"))
 
+    def test_match_line_ends_host_block(self):
+        # The directives under `Match` belong to it, not to the preceding Host block.
+        config = "Host alpha\n    Hostname 1.2.3.4\nmatch host foo\n    User x\nHost beta\n    Hostname 5.6.7.8\n"
+        lines = config.splitlines(keepends=True)
+        self.assertEqual(cb.find_host_block(lines, "alpha"), (0, 2))
+        self.assertEqual(cb.find_host_block(lines, "beta"), (4, 6))
+
     # --- update_ssh_config (in-place edit) ---
 
     def test_updates_hostname_only(self):
@@ -165,6 +172,10 @@ class SshConfigEditTests(unittest.TestCase):
         # `Host *` and `Host i-* mi-*` must not count as prefix matches
         defaults = cb._similar_block_defaults(self._lines(), "completely-unrelated-name")
         self.assertEqual(defaults, {})
+
+    def test_similar_block_defaults_ignores_following_match_block(self):
+        lines = "Host my-box\n    Hostname 1.2.3.4\nMatch host foo\n    User x\n".splitlines(keepends=True)
+        self.assertEqual(cb._similar_block_defaults(lines, "my-box-2"), {})
 
     # --- comment_out_hostname_in_block ---
 

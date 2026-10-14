@@ -318,6 +318,7 @@ def wait_for_public_ip(instance_id: str, region: str | None = None) -> str:
 HOST_LINE_RE = re.compile(r"^(\s*)(Host)(\s+)(.+?)\s*$", re.IGNORECASE)
 HOSTNAME_LINE_RE = re.compile(r"^(\s*)(HostName|Hostname)(\s+)(\S+)(.*)$", re.IGNORECASE)
 COMMENTED_HOSTNAME_LINE_RE = re.compile(r"^(\s*)#\s*(HostName|Hostname)(\s+)(\S+)(.*)$", re.IGNORECASE)
+MATCH_LINE_RE = re.compile(r"^\s*Match\s", re.IGNORECASE)
 
 
 def _host_tokens(line: str) -> list[str] | None:
@@ -327,18 +328,23 @@ def _host_tokens(line: str) -> list[str] | None:
     return m.group(4).split()
 
 
+def _starts_block(line: str) -> bool:
+    """True for a `Host` or `Match` line; either one ends the preceding block."""
+    return _host_tokens(line) is not None or MATCH_LINE_RE.match(line) is not None
+
+
 def find_host_block(lines: list[str], alias: str) -> tuple[int, int] | None:
     """Return (start_idx, end_idx_exclusive) of the Host block whose tokens contain `alias` exactly."""
     block_start = -1
     matched = False
     for i, line in enumerate(lines):
-        tokens = _host_tokens(line)
-        if tokens is None:
+        if not _starts_block(line):
             continue
         if matched:
             return block_start, i
         block_start = i
-        matched = alias in tokens
+        tokens = _host_tokens(line)
+        matched = tokens is not None and alias in tokens
     if matched:
         return block_start, len(lines)
     return None
@@ -398,7 +404,7 @@ def _similar_block_defaults(lines: list[str], alias: str) -> dict[str, str]:
             continue
         # Find block end.
         j = i + 1
-        while j < n and _host_tokens(lines[j]) is None:
+        while j < n and not _starts_block(lines[j]):
             j += 1
         for token in tokens:
             if any(ch in token for ch in "*?!"):
