@@ -265,6 +265,134 @@ class SshConfigEditTests(unittest.TestCase):
         self.assertIn("    Hostname 5.6.7.8\n", text)
         self.assertEqual(text.count("Hostname"), 1)
 
+    # --- remove_ssh_config ---
+
+    def _assert_ssh_accepts(self, alias):
+        result = subprocess.run(
+            ["ssh", "-G", alias, "-F", str(self.path)],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_remove_deletes_block(self):
+        removed = (
+            "Host my-dev-box-3\n"
+            "    User ubuntu\n"
+            "    # current IP\n"
+            "    Hostname 2.2.2.2\n"
+            "    IdentityFile ~/.ssh/id_ed25519\n"
+            "    IdentitiesOnly yes\n"
+            "\n"
+        )
+        cb.remove_ssh_config("my-dev-box-3")
+        # Exactly the block and its trailing blank line go; neighbors are intact.
+        self.assertEqual(self.path.read_text(), SAMPLE_CONFIG.replace(removed, ""))
+        self.assertTrue(cb.SSH_CONFIG_BACKUP.exists())
+        self._assert_ssh_accepts("my-dev-box-3")
+
+    def test_remove_last_block_drops_trailing_separator(self):
+        config = "Host alpha\n    Hostname 1.1.1.1\n\nHost beta\n    Hostname 2.2.2.2\n"
+        self.path.write_text(config)
+        cb.remove_ssh_config("beta")
+        self.assertEqual(self.path.read_text(), "Host alpha\n    Hostname 1.1.1.1\n")
+
+    def test_remove_only_block(self):
+        self.path.write_text("Host alpha\n    Hostname 1.1.1.1\n")
+        cb.remove_ssh_config("alpha")
+        self.assertEqual(self.path.read_text(), "")
+
+    def test_remove_keeps_comment_heading_next_block(self):
+        config = (
+            "Host alpha\n"
+            "    # current IP\n"
+            "    Hostname 1.1.1.1\n"
+            "\n"
+            "# beta is the build box\n"
+            "Host beta\n"
+            "    Hostname 2.2.2.2\n"
+        )
+        self.path.write_text(config)
+        cb.remove_ssh_config("alpha")
+        self.assertEqual(self.path.read_text(), "# beta is the build box\nHost beta\n    Hostname 2.2.2.2\n")
+
+    def test_remove_deletes_indented_trailing_comment(self):
+        config = (
+            "Host alpha\n"
+            "    Hostname 1.1.1.1\n"
+            "\n"
+            "Host beta\n"
+            "    Hostname 2.2.2.2\n"
+            "    # old note\n"
+            "\n"
+            "Host gamma\n"
+            "    Hostname 3.3.3.3\n"
+        )
+        self.path.write_text(config)
+        cb.remove_ssh_config("beta")
+        self.assertEqual(
+            self.path.read_text(), "Host alpha\n    Hostname 1.1.1.1\n\nHost gamma\n    Hostname 3.3.3.3\n"
+        )
+
+    def test_remove_deletes_heading_comment(self):
+        config = (
+            "# all my boxes\n"
+            "\n"
+            "Host alpha\n"
+            "    Hostname 1.1.1.1\n"
+            "\n"
+            "# beta is the old box\n"
+            "# (kept for reference)\n"
+            "Host beta\n"
+            "    Hostname 2.2.2.2\n"
+            "\n"
+            "Host gamma\n"
+            "    Hostname 3.3.3.3\n"
+        )
+        self.path.write_text(config)
+        cb.remove_ssh_config("beta")
+        self.assertEqual(
+            self.path.read_text(),
+            "# all my boxes\n\nHost alpha\n    Hostname 1.1.1.1\n\nHost gamma\n    Hostname 3.3.3.3\n",
+        )
+
+    def test_remove_deletes_heading_comment_of_last_block(self):
+        config = "Host alpha\n    Hostname 1.1.1.1\n\n# beta is the old box\nHost beta\n    Hostname 2.2.2.2\n"
+        self.path.write_text(config)
+        cb.remove_ssh_config("beta")
+        self.assertEqual(self.path.read_text(), "Host alpha\n    Hostname 1.1.1.1\n")
+
+    def test_remove_deletes_heading_comment_at_file_start(self):
+        config = "# alpha is the old box\nHost alpha\n    Hostname 1.1.1.1\n\nHost beta\n    Hostname 2.2.2.2\n"
+        self.path.write_text(config)
+        cb.remove_ssh_config("alpha")
+        self.assertEqual(self.path.read_text(), "Host beta\n    Hostname 2.2.2.2\n")
+
+    def test_remove_keeps_indented_comment_ending_previous_block(self):
+        config = "Host alpha\n    Hostname 1.1.1.1\n    # alpha note\nHost beta\n    Hostname 2.2.2.2\n"
+        self.path.write_text(config)
+        cb.remove_ssh_config("beta")
+        self.assertEqual(self.path.read_text(), "Host alpha\n    Hostname 1.1.1.1\n    # alpha note\n")
+
+    def test_remove_deletes_unindented_heading_comment_without_blank_line(self):
+        config = "Host alpha\n    Hostname 1.1.1.1\n# beta is the old box\nHost beta\n    Hostname 2.2.2.2\n"
+        self.path.write_text(config)
+        cb.remove_ssh_config("beta")
+        self.assertEqual(self.path.read_text(), "Host alpha\n    Hostname 1.1.1.1\n")
+
+    def test_remove_drops_only_alias_from_multi_token_host(self):
+        config = "Host alpha alpha-alt\n    Hostname 1.1.1.1\n"
+        self.path.write_text(config)
+        cb.remove_ssh_config("alpha")
+        self.assertEqual(self.path.read_text(), "Host alpha-alt\n    Hostname 1.1.1.1\n")
+        self._assert_ssh_accepts("alpha-alt")
+
+    def test_remove_no_block_does_not_touch_file_or_create_backup(self):
+        original = self.path.read_text()
+        cb.remove_ssh_config("nonexistent-alias")
+        self.assertEqual(self.path.read_text(), original)
+        self.assertFalse(cb.SSH_CONFIG_BACKUP.exists())
+
 
 class RegionGlobTests(unittest.TestCase):
     def test_split_csv_flattens(self):
@@ -388,6 +516,11 @@ class CmdListTests(unittest.TestCase):
 
 
 class CmdDownTests(unittest.TestCase):
+    def setUp(self):
+        terminates = patch.object(cb, "terminates_on_shutdown", return_value=False)
+        terminates.start()
+        self.addCleanup(terminates.stop)
+
     @staticmethod
     def _args(state, *, update_ssh=False, ssh_alias=None, name="my-dev-box"):
         return argparse.Namespace(
@@ -446,6 +579,102 @@ class CmdDownTests(unittest.TestCase):
         ):
             cb.cmd_down(self._args("running", update_ssh=False))
         disable.assert_not_called()
+
+    def _run_terminating(self, state, *, update_ssh=False, ssh_alias=None, terminate_error=None):
+        ec2 = MagicMock()
+        if terminate_error is not None:
+            ec2.terminate_instances.side_effect = terminate_error
+        with (
+            self._patch_describe(state),
+            patch.object(cb, "terminates_on_shutdown", return_value=True) as terminates,
+            patch.object(cb, "_ec2", return_value=ec2),
+            patch.object(cb, "disable_ssh_config") as disable,
+            patch.object(cb, "remove_ssh_config") as remove,
+        ):
+            rc = cb.cmd_down(self._args(state, update_ssh=update_ssh, ssh_alias=ssh_alias))
+        self.assertEqual(rc, 0)
+        return ec2, terminates, disable, remove
+
+    @staticmethod
+    def _terminate_error(code):
+        return botocore.exceptions.ClientError({"Error": {"Code": code, "Message": "no"}}, "TerminateInstances")
+
+    def test_terminate_on_shutdown_terminates_running(self):
+        # An API stop does not apply the shutdown behavior, so `down` must terminate explicitly.
+        for state in ("running", "pending"):
+            with self.subTest(state=state):
+                ec2, _, _, _ = self._run_terminating(state)
+                ec2.stop_instances.assert_not_called()
+                ec2.terminate_instances.assert_called_once_with(InstanceIds=["i-abc123"])
+
+    def test_terminate_on_shutdown_leaves_stopped_alone(self):
+        # A stopped terminate-behavior instance was stopped outside cloudvm; `down` does not delete it.
+        for state in ("stopped", "stopping"):
+            with self.subTest(state=state):
+                ec2, terminates, _, _ = self._run_terminating(state)
+                terminates.assert_not_called()
+                ec2.stop_instances.assert_not_called()
+                ec2.terminate_instances.assert_not_called()
+
+    def test_terminate_on_shutdown_update_ssh_removes(self):
+        # A terminated instance never comes back, so its alias is removed rather than disabled.
+        ec2, _, disable, remove = self._run_terminating("running", update_ssh=True)
+        ec2.terminate_instances.assert_called_once_with(InstanceIds=["i-abc123"])
+        remove.assert_called_once_with("my-dev-box")
+        disable.assert_not_called()
+
+    def test_terminate_on_shutdown_update_ssh_honors_ssh_alias_override(self):
+        _, _, _, remove = self._run_terminating("running", update_ssh=True, ssh_alias="my-alias")
+        remove.assert_called_once_with("my-alias")
+
+    def test_terminate_on_shutdown_without_update_ssh_does_not_touch_config(self):
+        _, _, disable, remove = self._run_terminating("running")
+        disable.assert_not_called()
+        remove.assert_not_called()
+
+    def test_termination_protection_falls_back_to_stop(self):
+        ec2, _, disable, remove = self._run_terminating(
+            "running", update_ssh=True, terminate_error=self._terminate_error("OperationNotPermitted")
+        )
+        ec2.terminate_instances.assert_called_once_with(InstanceIds=["i-abc123"])
+        ec2.stop_instances.assert_called_once_with(InstanceIds=["i-abc123"])
+        # The instance survives as stopped, so the alias is only disabled.
+        disable.assert_called_once_with("my-dev-box")
+        remove.assert_not_called()
+
+    def test_other_terminate_error_propagates_without_stop(self):
+        ec2 = MagicMock()
+        ec2.terminate_instances.side_effect = self._terminate_error("UnauthorizedOperation")
+        with (
+            self._patch_describe("running"),
+            patch.object(cb, "terminates_on_shutdown", return_value=True),
+            patch.object(cb, "_ec2", return_value=ec2),
+            patch.object(cb, "disable_ssh_config") as disable,
+            patch.object(cb, "remove_ssh_config") as remove,
+        ):
+            with self.assertRaises(cb.CloudvmError):
+                cb.cmd_down(self._args("running", update_ssh=True))
+        ec2.stop_instances.assert_not_called()
+        disable.assert_not_called()
+        remove.assert_not_called()
+
+
+class TerminatesOnShutdownTests(unittest.TestCase):
+    def _behavior(self, value):
+        ec2 = MagicMock()
+        ec2.describe_instance_attribute.return_value = {"InstanceInitiatedShutdownBehavior": {"Value": value}}
+        with patch.object(cb, "_ec2", return_value=ec2):
+            result = cb.terminates_on_shutdown("i-abc123")
+        ec2.describe_instance_attribute.assert_called_once_with(
+            InstanceId="i-abc123", Attribute="instanceInitiatedShutdownBehavior"
+        )
+        return result
+
+    def test_terminate(self):
+        self.assertTrue(self._behavior("terminate"))
+
+    def test_stop(self):
+        self.assertFalse(self._behavior("stop"))
 
 
 def _ice_error():

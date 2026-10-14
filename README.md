@@ -41,6 +41,14 @@ usual AWS environment variables (`AWS_REGION`, `AWS_PROFILE`, ...).
 Pass `--update-ssh` to `up` to point the matching `~/.ssh/config` host
 alias at the new IP.
 
+If a running instance's shutdown behavior is `terminate`, `down` terminates
+(deletes) it instead of stopping it. EC2 applies that behavior only when the OS
+shuts down, not on an API stop, so `down` does this explicitly. An instance that
+is already stopped is left alone. If termination protection refuses the
+terminate, `down` stops the instance instead. When `down --update-ssh`
+terminates an instance, it removes the alias from `~/.ssh/config` rather than
+commenting out its `Hostname`.
+
 When EC2 has no capacity for the instance type (`InsufficientInstanceCapacity`),
 pass `--retry DURATION` (e.g. `30m`, `2h`, `1h30m`) or `--retry forever` to
 `up` to keep trying with backoff. If the start succeeds only after retrying,

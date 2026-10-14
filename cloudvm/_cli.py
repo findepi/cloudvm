@@ -200,14 +200,18 @@ def ensure_running(instance: dict, region: str | None = None, retry_seconds: flo
     raise CloudvmError(f"instance {instance_id} is in unexpected state {state!r}")
 
 
-def _is_insufficient_capacity(exc: BaseException) -> bool:
+def _aws_error_code(exc: BaseException) -> str | None:
     import botocore.exceptions as bex
 
     # `_aws_call` wraps botocore errors as CloudvmError; the original is kept as `__cause__`.
     cause = exc.__cause__
-    return isinstance(cause, bex.ClientError) and cause.response.get("Error", {}).get("Code") == (
-        "InsufficientInstanceCapacity"
-    )
+    if not isinstance(cause, bex.ClientError):
+        return None
+    return cause.response.get("Error", {}).get("Code")
+
+
+def _is_insufficient_capacity(exc: BaseException) -> bool:
+    return _aws_error_code(exc) == "InsufficientInstanceCapacity"
 
 
 def start_with_capacity_retry(instance: dict, region: str | None, retry_seconds: float) -> bool:
@@ -550,6 +554,48 @@ def disable_ssh_config(alias: str) -> None:
     print(f"Updated {SSH_CONFIG}: Host {alias} Hostname disabled (backup at {SSH_CONFIG_BACKUP})")
 
 
+def remove_ssh_config(alias: str) -> None:
+    """Remove `alias` from ~/.ssh/config, for an instance that no longer exists.
+
+    The whole Host block goes when `alias` is its only token; otherwise only the token is dropped
+    from the Host line, so the block's other aliases keep working. No-op when the block doesn't exist.
+    """
+    if not SSH_CONFIG.exists():
+        raise CloudvmError(f"{SSH_CONFIG} does not exist; refusing to create it")
+
+    lines = SSH_CONFIG.read_text().splitlines(keepends=True)
+    block = find_host_block(lines, alias)
+    if block is None:
+        print(f"No `Host {alias}` block in {SSH_CONFIG}; skipped ssh_config update.")
+        return
+    start, end = block
+    m = HOST_LINE_RE.match(lines[start])
+    others = [token for token in m.group(4).split() if token != alias]
+    if others:
+        newline = "\n" if lines[start].endswith("\n") else ""
+        lines[start] = f"{m.group(1)}{m.group(2)}{m.group(3)}{' '.join(others)}{newline}"
+    else:
+        # An unindented comment introduces the block that follows it; an indented one belongs to the
+        # block before it. So unindented comments directly above the Host line go with the block,
+        # and so do indented comments after its last directive.
+        head = start
+        while head > 0 and lines[head - 1].startswith("#"):
+            head -= 1
+        cut = start + 1
+        for i in range(start + 1, end):
+            if lines[i].strip() and not lines[i].startswith("#"):
+                cut = i + 1
+        while cut < end and not lines[cut].strip():
+            cut += 1
+        del lines[head:cut]
+        if head == len(lines):
+            # The block was last; drop the blank separator that preceded it.
+            while lines and not lines[-1].strip():
+                lines.pop()
+    _commit_ssh_config("".join(lines), alias, expected_hostname=None)
+    print(f"Updated {SSH_CONFIG}: Host {alias} removed (backup at {SSH_CONFIG_BACKUP})")
+
+
 def validate_ssh(alias: str) -> None:
     print(f"Validating ssh to {alias} ...")
     result = subprocess.run(
@@ -591,21 +637,52 @@ def cmd_up(args: argparse.Namespace) -> int:
     return 0
 
 
+def terminates_on_shutdown(instance_id: str, region: str | None = None) -> bool:
+    """True if the instance's shutdown behavior is `terminate`.
+
+    EC2 applies that behavior only to an OS-initiated shutdown; an API stop leaves the instance stopped.
+    """
+    resp = _aws_call(
+        lambda: _ec2(region).describe_instance_attribute(
+            InstanceId=instance_id, Attribute="instanceInitiatedShutdownBehavior"
+        )
+    )
+    return resp["InstanceInitiatedShutdownBehavior"]["Value"] == "terminate"
+
+
 def cmd_down(args: argparse.Namespace) -> int:
     instance = describe_instance(args.name, args.region)
     instance_id = instance["InstanceId"]
     state = instance["State"]["Name"]
+    terminated = False
     if state == "stopped":
         print(f"{args.name} ({instance_id}) is already {_hl('stopped')}")
     elif state == "stopping":
         print(f"{args.name} ({instance_id}) is already {_hl('stopping')}")
     elif state in ("running", "pending"):
-        _aws_call(lambda: _ec2(args.region).stop_instances(InstanceIds=[instance_id]))
-        print(f"{args.name} ({instance_id}) is {_hl('stopping')}")
+        if terminates_on_shutdown(instance_id, args.region):
+            # An API stop would leave the instance stopped, so apply the shutdown behavior explicitly.
+            try:
+                _aws_call(lambda: _ec2(args.region).terminate_instances(InstanceIds=[instance_id]))
+                terminated = True
+            except CloudvmError as exc:
+                # Termination protection (DisableApiTermination) refuses the terminate; a stop still works.
+                if _aws_error_code(exc) != "OperationNotPermitted":
+                    raise
+                print(f"{args.name} ({instance_id}) cannot be terminated ({exc}); stopping it instead")
+        if terminated:
+            print(f"{args.name} ({instance_id}) has shutdown behavior {_hl('terminate')}; it is {_hl('shutting-down')}")
+        else:
+            _aws_call(lambda: _ec2(args.region).stop_instances(InstanceIds=[instance_id]))
+            print(f"{args.name} ({instance_id}) is {_hl('stopping')}")
     else:
         raise CloudvmError(f"instance {instance_id} is in unexpected state {state!r}")
     if args.update_ssh:
-        disable_ssh_config(args.ssh_alias or args.name)
+        alias = args.ssh_alias or args.name
+        if terminated:
+            remove_ssh_config(alias)
+        else:
+            disable_ssh_config(alias)
     return 0
 
 
@@ -881,7 +958,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     up.set_defaults(func=cmd_up)
 
-    down = sub.add_parser("down", help="trigger stop on a running instance (does not wait for fully stopped)")
+    down = sub.add_parser(
+        "down",
+        help="trigger stop on a running instance (does not wait for fully stopped); "
+        "terminates it instead if its shutdown behavior is terminate",
+    )
     down.add_argument(
         "--name", "-n", required=True, help="EC2 Name tag of the instance"
     ).completer = _complete_instance_name
@@ -891,7 +972,8 @@ def build_parser() -> argparse.ArgumentParser:
     down.add_argument(
         "--update-ssh",
         action="store_true",
-        help="comment out the matching Host block's Hostname in ~/.ssh/config",
+        help="comment out the matching Host block's Hostname in ~/.ssh/config; "
+        "remove the alias instead if the instance is terminated",
     )
     down.add_argument("--ssh-alias", help="ssh_config Host alias to update (defaults to --name)")
     down.set_defaults(func=cmd_down)
