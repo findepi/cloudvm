@@ -659,6 +659,56 @@ class CmdDownTests(unittest.TestCase):
         remove.assert_not_called()
 
 
+class CmdDeleteTests(unittest.TestCase):
+    @staticmethod
+    def _args(*, update_ssh=False, ssh_alias=None, name="my-dev-box"):
+        return argparse.Namespace(
+            name=name, region=["eu-north-1"], force=True, update_ssh=update_ssh, ssh_alias=ssh_alias
+        )
+
+    @staticmethod
+    def _instance(name, instance_id="i-abc123"):
+        return {"region": "eu-north-1", "instance_id": instance_id, "name": name, "state": "running", "public_ip": "-"}
+
+    def _run(self, instances, args):
+        with (
+            patch.object(cb, "_find_instances_in_region", return_value=instances),
+            patch.object(cb, "_ec2") as ec2,
+            patch.object(cb, "remove_ssh_config") as remove,
+        ):
+            rc = cb.cmd_delete(args)
+        return rc, ec2, remove
+
+    def test_update_ssh_removes_alias(self):
+        rc, ec2, remove = self._run([self._instance("my-dev-box")], self._args(update_ssh=True))
+        self.assertEqual(rc, 0)
+        ec2.return_value.terminate_instances.assert_called_once_with(InstanceIds=["i-abc123"])
+        remove.assert_called_once_with("my-dev-box")
+
+    def test_update_ssh_removes_each_matched_name_once(self):
+        instances = [self._instance("box-1", "i-1"), self._instance("box-2", "i-2"), self._instance("box-1", "i-3")]
+        _, _, remove = self._run(instances, self._args(update_ssh=True, name="box-*"))
+        self.assertEqual([c.args for c in remove.call_args_list], [("box-1",), ("box-2",)])
+
+    def test_update_ssh_honors_ssh_alias_override(self):
+        _, _, remove = self._run([self._instance("my-dev-box")], self._args(update_ssh=True, ssh_alias="my-alias"))
+        remove.assert_called_once_with("my-alias")
+
+    def test_ssh_alias_with_multiple_matches_is_rejected_before_terminating(self):
+        instances = [self._instance("box-1", "i-1"), self._instance("box-2", "i-2")]
+        with self.assertRaises(cb.CloudvmError):
+            self._run(instances, self._args(update_ssh=True, ssh_alias="my-alias", name="box-*"))
+
+    def test_without_update_ssh_does_not_touch_config(self):
+        _, _, remove = self._run([self._instance("my-dev-box")], self._args())
+        remove.assert_not_called()
+
+    def test_parser_accepts_update_ssh(self):
+        args = cb.build_parser().parse_args(["delete", "--name", "x", "--update-ssh", "--ssh-alias", "y"])
+        self.assertTrue(args.update_ssh)
+        self.assertEqual(args.ssh_alias, "y")
+
+
 class TerminatesOnShutdownTests(unittest.TestCase):
     def _behavior(self, value):
         ec2 = MagicMock()

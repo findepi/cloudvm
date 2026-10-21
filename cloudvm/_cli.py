@@ -832,6 +832,9 @@ def cmd_delete(args: argparse.Namespace) -> int:
         print("(no instances match)")
         return 0
 
+    if args.update_ssh and args.ssh_alias and len(instances) > 1:
+        raise CloudvmError(f"--ssh-alias needs exactly one matching instance, but {len(instances)} match")
+
     instances.sort(key=lambda i: (i["region"], i["name"]))
     rows = [[i["region"], i["name"], i["instance_id"], i["state"], i["public_ip"]] for i in instances]
     print(
@@ -860,6 +863,11 @@ def cmd_delete(args: argparse.Namespace) -> int:
         _aws_call(lambda: _ec2(region).terminate_instances(InstanceIds=ids))
         for inst in region_instances:
             print(f"{inst['name']} ({inst['instance_id']}) is {_hl('shutting-down')}")
+
+    if args.update_ssh:
+        aliases = [args.ssh_alias] if args.ssh_alias else list(dict.fromkeys(i["name"] for i in instances))
+        for alias in aliases:
+            remove_ssh_config(alias)
 
     return 0
 
@@ -990,6 +998,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="region glob(s); repeatable and/or comma-separated. Defaults to AWS_REGION / AWS_DEFAULT_REGION.",
     ).completer = _complete_region
     delete.add_argument("-f", "--force", action="store_true", help="skip the confirmation prompt")
+    delete.add_argument(
+        "--update-ssh", action="store_true", help="remove each deleted instance's alias from ~/.ssh/config"
+    )
+    delete.add_argument(
+        "--ssh-alias", help="ssh_config Host alias to remove (defaults to the instance name; needs a single match)"
+    )
     delete.set_defaults(func=cmd_delete)
 
     lst = sub.add_parser("list", help="list instances across regions matching name and region globs")
