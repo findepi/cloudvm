@@ -55,3 +55,14 @@ jobs:
           uv build --no-build-isolation
           uv run --isolated --no-project --with dist/*.whl cloudvm --version \
             | grep -F "cloudvm 1.2.3.4.5 (deadbeef0 2026-01-01)"
+
+  # Single required status check for the ruleset on main, so it need not list every matrix entry.
+  test-workflow-successful:
+    if: ${{ always() }} # if `failure()` would not work for cancellations, `!success()` would not work for skipped jobs
+    runs-on: ubuntu-latest
+    needs:
+      - test
+    steps:
+      - name: Check results
+        run: |
+          echo '${{ needs.test.result }}' | grep -xE 'success|skipped' || { echo 'Job "test" failed' >&2; exit 1; }
